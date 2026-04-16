@@ -1,12 +1,12 @@
-'use client';
+"use client";
 
-import { useRouter } from 'next/navigation';
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { Masthead } from '@/components/masthead';
-import { Composer } from '@/components/letter/composer';
-import { Turn } from '@/components/letter/turn';
-import { sendTurn, getResult } from '@/lib/api';
-import type { LetterState, TurnRecord } from '@/lib/types';
+import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Masthead } from "@/components/masthead";
+import { Composer } from "@/components/letter/composer";
+import { Turn } from "@/components/letter/turn";
+import { sendTurn, getResult } from "@/lib/api";
+import type { LetterState, TurnRecord } from "@/lib/types";
 
 interface Props {
   letterId: string;
@@ -31,7 +31,7 @@ export function LetterView({ letterId, initialState }: Props) {
 
   // Auto-scroll to the freshest turn
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [turns.length, isThinking]);
 
   const handleSend = useCallback(
@@ -40,7 +40,7 @@ export function LetterView({ letterId, initialState }: Props) {
 
       // Optimistic user turn
       const userTurn: TurnRecord = {
-        speaker: 'you',
+        speaker: "you",
         text: text.trim(),
         round: turns.length + 1,
       };
@@ -59,10 +59,10 @@ export function LetterView({ letterId, initialState }: Props) {
           action.next_question?.trim() ||
           action.echo?.trim() ||
           action.text?.trim() ||
-          '……';
+          "……";
 
         const oriselfTurn: TurnRecord = {
-          speaker: 'oriself',
+          speaker: "oriself",
           text: visible,
           round: res.round_number,
         };
@@ -70,19 +70,19 @@ export function LetterView({ letterId, initialState }: Props) {
         setTurns((prev) => [...prev, oriselfTurn]);
 
         // Converge → redirect to issue page
-        if (action.action === 'converge') {
+        if (action.action === "converge") {
           const result = await getResult(letterId);
           if (result.issue_slug) {
             router.push(`/issues/${result.issue_slug}`);
           }
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : '发送失败，稍后再试');
+        setError(err instanceof Error ? err.message : "发送失败，稍后再试");
       } finally {
         setIsThinking(false);
       }
     },
-    [letterId, turns.length, isThinking, router]
+    [letterId, turns.length, isThinking, router],
   );
 
   const currentRound = turns.length;
@@ -94,7 +94,9 @@ export function LetterView({ letterId, initialState }: Props) {
           <>
             <span>letter</span>
             <span className="mx-[10px] opacity-50">·</span>
-            <span className="text-accent">round {String(currentRound).padStart(2, '0')}</span>
+            <span className="text-accent">
+              round {String(currentRound).padStart(2, "0")}
+            </span>
           </>
         }
       />
@@ -102,17 +104,21 @@ export function LetterView({ letterId, initialState }: Props) {
       <main className="relative z-10 max-w-[620px] mx-auto px-8 pt-[140px] pb-[260px]">
         {turns.length === 0 && (
           <div className="mb-14">
-            <p className="font-mono text-[10px] tracking-widest uppercase text-accent mb-5">
-              letter · round 01
-            </p>
-            <h1 className="fraunces-display-italic text-[38px] leading-[1.18] tracking-tightest text-ink max-w-[18ch]">
-              <span className="text-accent" style={{ fontVariationSettings: '"opsz" 144, "SOFT" 0, "WONK" 1' }}>
-                不
-              </span>
-              是测试，
-              <br />
-              是我<em>想多认识你一点</em>。
-            </h1>
+            {/* Just the round number. No headline, no copy. */}
+            <span
+              className="text-accent"
+              style={{
+                fontFamily: "var(--font-serif)",
+                fontVariationSettings: '"opsz" 144, "SOFT" 100, "WONK" 1',
+                fontStyle: "italic",
+                fontWeight: 400,
+                fontSize: "clamp(72px, 12vw, 132px)",
+                lineHeight: 1,
+                letterSpacing: "-0.04em",
+              }}
+            >
+              01.
+            </span>
           </div>
         )}
 
@@ -121,7 +127,7 @@ export function LetterView({ letterId, initialState }: Props) {
             key={`${turn.round}-${turn.speaker}-${i}`}
             turn={turn}
             // Last OriSelf turn reveals line-by-line; older turns settle in instantly
-            reveal={turn.speaker === 'oriself' && i === turns.length - 1}
+            reveal={turn.speaker === "oriself" && i === turns.length - 1}
           />
         ))}
 
@@ -129,7 +135,8 @@ export function LetterView({ letterId, initialState }: Props) {
           <div className="mb-14 opacity-70">
             <p className="fraunces-body text-[20px] leading-[1.62] text-ink">
               <span className="inline-block">
-                正在听<span className="writing-cursor" />
+                正在听
+                <span className="writing-cursor" />
               </span>
             </p>
           </div>
