@@ -34,8 +34,10 @@ const nextConfig = {
     ];
   },
 
-  // Standalone output for Docker
-  output: 'standalone',
+  // Standalone output only when building for Docker.
+  // Local `pnpm build && pnpm start` works with default output — no warning.
+  // Docker sets BUILD_STANDALONE=1 (see web/Dockerfile) to emit .next/standalone.
+  output: process.env.BUILD_STANDALONE === '1' ? 'standalone' : undefined,
 };
 
 export default nextConfig;
