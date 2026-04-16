@@ -1,0 +1,49 @@
+# OriSelf Next · 本地一键起
+# 用法: docker compose up --build
+#
+# 服务:
+#   server · FastAPI @ :8000 · SQLite 挂到 ./data
+#   web    · Next.js @ :3000
+
+services:
+  server:
+    build: ./server
+    container_name: oriself-server
+    ports:
+      - "8000:8000"
+    environment:
+      - ORISELF_PROVIDER=${ORISELF_PROVIDER:-mock}
+      - ORISELF_DB_PATH=/data/oriself.db
+      - ORISELF_SKILL_ROOT=/app/skill-repo/skills/oriself
+      - ORISELF_CORS_ORIGINS=${ORISELF_CORS_ORIGINS:-*}
+      - ORISELF_DEEPSEEK_API_KEY=${ORISELF_DEEPSEEK_API_KEY:-}
+      - ORISELF_QWEN_API_KEY=${ORISELF_QWEN_API_KEY:-}
+      - ORISELF_KIMI_API_KEY=${ORISELF_KIMI_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    volumes:
+      - ./data:/data
+      - ./skill-repo:/app/skill-repo:ro  # submodule 挂载，只读
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  web:
+    build: ./web
+    container_name: oriself-web
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      - API_INTERNAL_URL=http://server:8000
+      - NODE_ENV=production
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  data:

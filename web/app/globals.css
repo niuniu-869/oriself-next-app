@@ -1,0 +1,129 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ═══════════════════════════════════════════════════════════════════
+   OriSelf · Design tokens
+   Paper, ink, oxblood. One accent. Editorial, not SaaS.
+   ═══════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* Paper & ink */
+  --paper:        #F5F0E6;
+  --paper-deep:   #EDE5D4;
+  --paper-warm:   #F9F4E8;
+  --ink:          #1A1512;
+  --ink-soft:     #4A3F36;
+  --ink-muted:    #8A7F72;
+  --rule:         rgba(26, 21, 18, 0.10);
+  --rule-strong:  rgba(26, 21, 18, 0.22);
+
+  /* The one accent. Oxblood. */
+  --accent:       #7A1F1A;
+  --accent-soft:  #963028;
+
+  /* Type stacks — next/font injects --font-*-var variables in layout.tsx */
+  --font-serif:   var(--font-fraunces), 'Noto Serif SC', Georgia, serif;
+  --font-sans:    var(--font-instrument), system-ui, sans-serif;
+  --font-mono:    var(--font-jetbrains), Consolas, monospace;
+
+  /* Motion */
+  --spring:       cubic-bezier(0.34, 1.25, 0.64, 1);
+  --ease:         cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* ═══ Base reset ═══ */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-serif);
+  font-variation-settings: "opsz" 14, "SOFT" 50, "WONK" 0;
+  font-weight: 400;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+
+/* Paper noise — subtle, essential */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.045;
+  mix-blend-mode: multiply;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.1 0 0 0 0 0.08 0 0 0 0 0.07 0 0 0 1 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background: radial-gradient(ellipse at center, transparent 50%, rgba(26, 21, 18, 0.06) 100%);
+}
+
+/* Selection */
+::selection {
+  background: rgba(122, 31, 26, 0.14);
+  color: var(--ink);
+}
+
+/* ═══ Writing cursor (for inline typewriter) ═══ */
+.writing-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 0.9em;
+  background: var(--accent);
+  vertical-align: text-bottom;
+  margin-left: 2px;
+  animation: blink 1.1s infinite;
+}
+
+/* ═══ Fraunces variable axis helpers ═══
+   Fraunces supports opsz (9-144), SOFT (0-100), WONK (0-1). We expose a
+   handful of semantic classes for display sizes. Production: these could
+   be Tailwind utilities, but keeping them here for clarity.
+*/
+.fraunces-display {
+  font-variation-settings: "opsz" 72, "SOFT" 100, "WONK" 1;
+}
+
+.fraunces-display-italic {
+  font-style: italic;
+  font-variation-settings: "opsz" 72, "SOFT" 100, "WONK" 1;
+}
+
+.fraunces-body {
+  font-variation-settings: "opsz" 18, "SOFT" 60, "WONK" 0;
+}
+
+.fraunces-body-soft {
+  font-variation-settings: "opsz" 18, "SOFT" 40, "WONK" 0;
+}
+
+.fraunces-brand {
+  font-variation-settings: "opsz" 20, "SOFT" 30, "WONK" 1;
+  font-style: italic;
+}
+
+/* ═══ No focus ring on keyboard-invisible elements ═══ */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}

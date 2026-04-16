@@ -1,0 +1,3 @@
+[submodule "skill-repo"]
+	path = skill-repo
+	url = https://github.com/niuniu-869/oriself-next.git

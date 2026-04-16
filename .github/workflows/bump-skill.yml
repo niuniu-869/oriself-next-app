@@ -1,0 +1,50 @@
+name: Bump skill submodule
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'   # 每周一 UTC 09:00（北京时间 17:00）
+  workflow_dispatch:       # 手动触发
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Update skill submodule to latest main
+        run: |
+          cd skill-repo
+          git fetch origin main
+          git checkout origin/main
+          cd ..
+          git diff --exit-code skill-repo && echo "No changes" && exit 0 || true
+
+      - name: Read new skill version
+        id: skill
+        run: |
+          cd skill-repo
+          VERSION=$(grep -E '^version:' skills/oriself/SKILL.md | awk '{print $2}')
+          COMMIT=$(git rev-parse --short HEAD)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v5
+        with:
+          branch: bump-skill
+          title: "chore: bump skill to v${{ steps.skill.outputs.version }} (${{ steps.skill.outputs.commit }})"
+          commit-message: "chore: bump skill submodule"
+          body: |
+            自动升级 skill submodule 到最新 main。
+
+            - 版本: v${{ steps.skill.outputs.version }}
+            - Commit: `${{ steps.skill.outputs.commit }}`
+
+            Review 完合并即自动部署。
