@@ -1,0 +1,59 @@
+# OriSelf Next · FastAPI 后端 · Fly.io 部署清单
+#
+# 用法：
+#   fly launch --no-deploy --copy-config deploy/fly.toml   # 首次
+#   fly secrets set ORISELF_DEEPSEEK_API_KEY=sk-...        # 至少配一家 LLM
+#   fly volumes create oriself_data --region hkg --size 1  # 1GB SQLite volume
+#   fly deploy --config deploy/fly.toml --dockerfile server/Dockerfile
+#
+# 若迁移到 Postgres：改 ORISELF_DB_PATH 为连接串、去掉 mounts。
+
+app = "oriself-api"
+primary_region = "hkg"   # 亚太低延迟；用户群偏中文
+kill_signal = "SIGINT"
+kill_timeout = 30
+
+[build]
+  # context 默认是项目根目录；这个 Dockerfile 会把 server/* 与 skill-repo/* 都烘入镜像
+  dockerfile = "deploy/Dockerfile.fly"
+
+[env]
+  ORISELF_PROVIDER = "deepseek"
+  ORISELF_DB_PATH = "/data/oriself.db"
+  ORISELF_SKILL_ROOT = "/app/skill-repo/skills/oriself"
+  ORISELF_CORS_ORIGINS = "https://next.oriself.com,https://www.next.oriself.com"
+  PORT = "8000"
+
+# SQLite 持久化（MVP）。生产建议迁 Postgres。
+[mounts]
+  source = "oriself_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = true    # 空闲 5 分钟停机，省钱
+  auto_start_machines = true
+  min_machines_running = 0     # cold start 可接受（MVP 流量低）
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 20
+    hard_limit = 30
+
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "10s"
+  method = "GET"
+  path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[deploy]
+  strategy = "rolling"

@@ -1,0 +1,43 @@
+# OriSelf Next · FastAPI 后端 · Fly.io 专用 Dockerfile
+#
+# 与 server/Dockerfile 区别：
+#   - build context 是项目根（含 skill-repo submodule）
+#   - skill-repo 烘入镜像，部署时不依赖 volume mount
+#
+# 部署：fly deploy --dockerfile deploy/Dockerfile.fly
+FROM python:3.12-slim AS base
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# 依赖层
+COPY server/pyproject.toml /app/
+RUN pip install --upgrade pip \
+    && pip install -e . \
+    && pip install uvicorn[standard]
+
+# 代码层
+COPY server/oriself_server /app/oriself_server
+COPY server/tests /app/tests
+
+# Skill 本体：从 submodule 烘入（确保生产永远带着与代码配套的 skill 版本）
+COPY skill-repo /app/skill-repo
+
+VOLUME ["/data"]
+ENV ORISELF_DB_PATH=/data/oriself.db \
+    ORISELF_SKILL_ROOT=/app/skill-repo/skills/oriself
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["uvicorn", "oriself_server.main:app", "--host", "0.0.0.0", "--port", "8000"]
