@@ -10,19 +10,21 @@
  */
 
 import type {
+  FeedbackPayload,
+  FeedbackResponse,
   IssueMeta,
   LetterCreateResponse,
   LetterResult,
   LetterState,
   TurnResponse,
-} from './types';
+} from "./types";
 
 function baseUrl(): string {
   // Server-side: use internal Docker URL. Client-side: relative /api path.
-  if (typeof window === 'undefined') {
-    return process.env.API_INTERNAL_URL || 'http://localhost:8000';
+  if (typeof window === "undefined") {
+    return process.env.API_INTERNAL_URL || "http://localhost:8000";
   }
-  return '/api';
+  return "/api";
 }
 
 async function jsonFetch<T>(path: string, init?: RequestInit): Promise<T> {
@@ -30,13 +32,13 @@ async function jsonFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, {
     ...init,
     headers: {
-      'Content-Type': 'application/json',
+      "Content-Type": "application/json",
       ...(init?.headers ?? {}),
     },
-    cache: 'no-store',
+    cache: "no-store",
   });
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
+    const text = await res.text().catch(() => "");
     throw new Error(`${res.status} ${res.statusText}: ${text || path}`);
   }
   return res.json() as Promise<T>;
@@ -46,10 +48,10 @@ async function jsonFetch<T>(path: string, init?: RequestInit): Promise<T> {
 
 export async function createLetter(
   provider?: string,
-  domain = 'mbti'
+  domain = "mbti",
 ): Promise<LetterCreateResponse> {
-  return jsonFetch('/letters', {
-    method: 'POST',
+  return jsonFetch("/letters", {
+    method: "POST",
     body: JSON.stringify({ provider: provider ?? undefined, domain }),
   });
 }
@@ -60,10 +62,10 @@ export async function getLetterState(letterId: string): Promise<LetterState> {
 
 export async function sendTurn(
   letterId: string,
-  userMessage: string
+  userMessage: string,
 ): Promise<TurnResponse> {
   return jsonFetch(`/letters/${letterId}/turn`, {
-    method: 'POST',
+    method: "POST",
     body: JSON.stringify({ user_message: userMessage }),
   });
 }
@@ -80,10 +82,21 @@ export async function getIssue(slug: string): Promise<IssueMeta> {
 
 export async function publishIssue(
   slug: string,
-  isPublic: boolean
+  isPublic: boolean,
 ): Promise<IssueMeta> {
   return jsonFetch(`/issues/${slug}/publish`, {
-    method: 'PATCH',
+    method: "PATCH",
     body: JSON.stringify({ is_public: isPublic }),
+  });
+}
+
+// ───── Feedback ─────
+
+export async function submitFeedback(
+  payload: FeedbackPayload,
+): Promise<FeedbackResponse> {
+  return jsonFetch("/feedback", {
+    method: "POST",
+    body: JSON.stringify(payload),
   });
 }

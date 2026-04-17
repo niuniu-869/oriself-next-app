@@ -52,14 +52,14 @@ export function LetterView({ letterId, initialState }: Props) {
         const res = await sendTurn(letterId, text.trim());
         const { action } = res;
 
-        // Extract the visible text from the LLM's action. The schema stores
-        // "next_question" for open exploration or a prose "echo" for reflect.
-        // For the scaffold we accept either.
+        // v2.3：可见文本统一在 next_prompt。converge 不带可见话术（直接跳报告）。
+        // 兼容字段保留作 mock/旧 provider 的兜底。
         const visible =
+          action.next_prompt?.trim() ||
           action.next_question?.trim() ||
           action.echo?.trim() ||
           action.text?.trim() ||
-          "……";
+          (action.action === "converge" ? "信收束了，正在写报告……" : "……");
 
         const oriselfTurn: TurnRecord = {
           speaker: "oriself",
@@ -151,7 +151,7 @@ export function LetterView({ letterId, initialState }: Props) {
         <div ref={endRef} />
       </main>
 
-      <Composer onSend={handleSend} disabled={isThinking} />
+      <Composer onSend={handleSend} disabled={isThinking} draftKey={letterId} />
     </>
   );
 }

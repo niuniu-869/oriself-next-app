@@ -1,10 +1,36 @@
-'use client';
+"use client";
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from "react";
 
 interface Props {
   onSend: (text: string) => void;
   disabled?: boolean;
+  /**
+   * 草稿持久化 key — 通常传 letterId。每封信独立草稿；不传则不暂存。
+   */
+  draftKey?: string;
+}
+
+const DRAFT_PREFIX = "oriself:draft:";
+const DRAFT_DEBOUNCE_MS = 400;
+
+function readDraft(key: string): string {
+  if (typeof window === "undefined") return "";
+  try {
+    return window.localStorage.getItem(DRAFT_PREFIX + key) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeDraft(key: string, value: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (value) window.localStorage.setItem(DRAFT_PREFIX + key, value);
+    else window.localStorage.removeItem(DRAFT_PREFIX + key);
+  } catch {
+    /* quota exceeded etc. — silent */
+  }
 }
 
 /**
@@ -12,38 +38,81 @@ interface Props {
  *
  * The underline IS the input. On focus the underline turns oxblood.
  * Cmd/Ctrl+Enter sends.
+ *
+ * 草稿（ESC 暂存）：
+ *  - 输入随时持久化到 localStorage（debounced），下次进同一封信自动恢复。
+ *  - ESC = 主动暂存 + 失焦：刷新视觉反馈「刚刚已存」。
+ *  - 发送成功后清空草稿。
  */
-export function Composer({ onSend, disabled }: Props) {
-  const [text, setText] = useState('');
+export function Composer({ onSend, disabled, draftKey }: Props) {
+  const [text, setText] = useState("");
+  const [savedHint, setSavedHint] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const debounceRef = useRef<number | null>(null);
 
-  // Auto-grow
+  // 进入时恢复草稿
+  useEffect(() => {
+    if (!draftKey) return;
+    const draft = readDraft(draftKey);
+    if (draft) setText(draft);
+  }, [draftKey]);
+
+  // 自动增高
   useEffect(() => {
     const ta = taRef.current;
     if (!ta) return;
-    ta.style.height = 'auto';
-    ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
+    ta.style.height = "auto";
+    ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
   }, [text]);
+
+  // 草稿 debounced 持久化
+  useEffect(() => {
+    if (!draftKey) return;
+    if (debounceRef.current) window.clearTimeout(debounceRef.current);
+    debounceRef.current = window.setTimeout(() => {
+      writeDraft(draftKey, text);
+    }, DRAFT_DEBOUNCE_MS);
+    return () => {
+      if (debounceRef.current) window.clearTimeout(debounceRef.current);
+    };
+  }, [text, draftKey]);
 
   const handleSend = useCallback(() => {
     const trimmed = text.trim();
     if (!trimmed || disabled) return;
     onSend(trimmed);
-    setText('');
-    // Reset textarea height
+    setText("");
+    if (draftKey) writeDraft(draftKey, "");
     requestAnimationFrame(() => {
-      if (taRef.current) taRef.current.style.height = 'auto';
+      if (taRef.current) taRef.current.style.height = "auto";
     });
-  }, [text, disabled, onSend]);
+  }, [text, disabled, onSend, draftKey]);
+
+  const handleStashDraft = useCallback(() => {
+    if (!draftKey) {
+      // 没有 draftKey 时 ESC 仅失焦
+      taRef.current?.blur();
+      return;
+    }
+    writeDraft(draftKey, text);
+    taRef.current?.blur();
+    setSavedHint(true);
+    window.setTimeout(() => setSavedHint(false), 1600);
+  }, [text, draftKey]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
         e.preventDefault();
         handleSend();
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        handleStashDraft();
       }
     },
-    [handleSend]
+    [handleSend, handleStashDraft],
   );
 
   return (
@@ -51,7 +120,7 @@ export function Composer({ onSend, disabled }: Props) {
       className="fixed left-0 right-0 bottom-0 z-[8] px-8 pt-20 pb-9 pointer-events-none"
       style={{
         background:
-          'linear-gradient(to top, var(--paper) 55%, rgba(245, 240, 230, 0.92) 80%, rgba(245, 240, 230, 0))',
+          "linear-gradient(to top, var(--paper) 55%, rgba(245, 240, 230, 0.92) 80%, rgba(245, 240, 230, 0))",
       }}
     >
       <div className="max-w-[620px] mx-auto pointer-events-auto">
@@ -61,14 +130,18 @@ export function Composer({ onSend, disabled }: Props) {
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={disabled ? '正在听……' : '写下你想到的第一件事，不必修饰……'}
+          placeholder={
+            disabled ? "正在听……" : "写下你想到的第一件事，不必修饰……"
+          }
           disabled={disabled}
           className="w-full bg-transparent fraunces-body-soft text-[20px] leading-[1.55] text-ink resize-none outline-none pt-[6px] pb-[10px] border-b border-rule-strong focus:border-accent transition-colors duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] disabled:opacity-60 placeholder:italic placeholder:text-ink-muted placeholder:opacity-70"
-          style={{ caretColor: 'var(--accent)' }}
+          style={{ caretColor: "var(--accent)" }}
         />
 
         <div className="flex justify-between items-center mt-[14px] font-mono text-[10px] tracking-wide uppercase text-ink-muted">
-          <span>⌘ ↵ 发送 · ESC 暂存</span>
+          <span aria-live="polite">
+            {savedHint ? "已暂存 · 下次回来还在" : "⌘ ↵ 发送 · ESC 暂存"}
+          </span>
           <button
             onClick={handleSend}
             disabled={disabled || !text.trim()}
