@@ -47,6 +47,7 @@ class IssueResponse(BaseModel):
     mbti_type: str
     is_public: bool
     created_at: datetime
+    letter_id: Optional[str] = None  # owner 操作（回看对话）入口
 
 
 class PublishRequest(BaseModel):
@@ -76,6 +77,7 @@ def get_issue(slug: str, db: Session = Depends(get_db)):
         mbti_type=result.mbti_type,
         is_public=result.issue_is_public,
         created_at=result.issue_generated_at or result.created_at,
+        letter_id=result.session_id,
     )
 
 
@@ -143,4 +145,5 @@ def publish_issue(
         mbti_type=result.mbti_type,
         is_public=result.issue_is_public,
         created_at=result.issue_generated_at or result.created_at,
+        letter_id=result.session_id,
     )

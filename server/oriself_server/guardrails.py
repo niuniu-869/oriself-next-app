@@ -193,6 +193,13 @@ class OriSelfGuardrails:
 
     # ------------------------------------------------------------------
     # 3. Evidence grounding（字面校验）
+    #
+    # v2.3 设计转向：不再硬锁 `round_number == current_round`。
+    # 实证观察（v2.2 session 复盘）：当 LLM 想引前几轮原话做 evidence 时，
+    # 硬锁会逼 LLM 把 round_number 谎报为当前轮，反而绕开校验、引错内容。
+    # 新策略：LLM 可以诚实标注抽自哪一轮；guardrails 只管"quote 必须是
+    # 该轮 user_message 字面子串"这条结构不变式。去重在 advance_state 层
+    # 做（`(dimension, user_quote)` set），回头刷旧 quote 也不会虚增计数。
     # ------------------------------------------------------------------
     def verify_evidence_grounding(
         self, evidences: Sequence[Evidence], session: SessionState,
@@ -201,25 +208,22 @@ class OriSelfGuardrails:
         if not evidences:
             return GuardrailResult.ok()
         by_round: Dict[int, str] = {t.round_number: t.user_message for t in session.turns}
+        # v2.3：current_round 参数保留但不再 reject——允许诚实回引历史轮
         reasons: List[str] = []
         for ev in evidences:
-            if current_round is not None and ev.round_number != current_round:
-                reasons.append(
-                    f"evidence.round_number={ev.round_number} must equal current round "
-                    f"{current_round}; 不要回头抽历史 quote（历史 evidence 已在 "
-                    "collected_evidence 里）"
-                )
-                continue
             msg = by_round.get(ev.round_number)
             if msg is None:
                 reasons.append(
-                    f"evidence.round_number={ev.round_number} does not exist in session"
+                    f"evidence.round_number={ev.round_number} 不存在于 session; "
+                    f"请把 round_number 标成 quote 真正来源的那一轮"
                 )
                 continue
             if ev.user_quote not in msg:
                 reasons.append(
-                    f"evidence.user_quote not a verbatim substring of round {ev.round_number}: "
-                    f"quote={ev.user_quote[:40]!r}"
+                    f"evidence.user_quote 不是 R{ev.round_number} 的字面子串: "
+                    f"quote={ev.user_quote[:40]!r}; "
+                    f"请把 round_number 改成 quote 真正来源的那一轮，"
+                    f"或者 quote 改成该轮里真的出现过的字面片段"
                 )
         return GuardrailResult.ok() if not reasons else GuardrailResult.fail(*reasons)
 
@@ -259,6 +263,9 @@ class OriSelfGuardrails:
     _RE_JS_URL = re.compile(r"javascript\s*:", re.IGNORECASE)
     # v2.2.3 · 模板占位符泄漏（LLM 以为是模板引擎，留了没替换的变量）
     _RE_TEMPLATE_PLACEHOLDER = re.compile(r"\{\{\s*[\w_.-]+\s*\}\}")
+    # v2.3 · MBTI 4 字母串（按维度合法字母各取一个，恰好 4 个字母连写）
+    #    用于 HTML 里的字面一致性校验：每一处 4 字母串都必须等于派生 mbti_type
+    _RE_MBTI_TOKEN = re.compile(r"(?<![A-Za-z])[EI][SN][TF][JP](?![A-Za-z])")
 
     def verify_report_html_shape(self, html: str) -> "GuardrailResult":
         """检查 report_html 的安全边界。
@@ -293,6 +300,29 @@ class OriSelfGuardrails:
                 "请直接把值写进 HTML，不要留 {{...}} 占位符"
             )
         return GuardrailResult.ok() if not reasons else GuardrailResult.fail(*reasons)
+
+    # ------------------------------------------------------------------
+    # 5b. Report HTML 与 mbti_type 的字面一致性（v2.3 新增）
+    #
+    # 设计：ConvergeOutput.mbti_type 由 confidence_per_dim 派生（单一真相源），
+    # 但 LLM 写的 report_html 里仍可能出现不同的 4 字母串（title 写 INFJ、
+    # 维度区拼出 INFP）。这里 post-hoc 扫描 HTML 里所有"恰好 4 字母且字母
+    # 合法组合"的 token，任一与派生值不等 → reject，把实际冲突值告诉 LLM。
+    # ------------------------------------------------------------------
+    def verify_report_html_consistency(
+        self, html: str, mbti_type: str
+    ) -> "GuardrailResult":
+        if not html or not mbti_type:
+            return GuardrailResult.ok()
+        found = set(self._RE_MBTI_TOKEN.findall(html))
+        mismatched = [tok for tok in found if tok != mbti_type]
+        if mismatched:
+            return GuardrailResult.fail(
+                f"report_html 里出现 {sorted(mismatched)} 与派生 mbti_type="
+                f"{mbti_type!r} 不一致; 派生值来自 confidence_per_dim，"
+                f"请把 HTML 里所有 MBTI 4 字母处都写成 {mbti_type!r}"
+            )
+        return GuardrailResult.ok()
 
     # ------------------------------------------------------------------
     # 5. Insight grounding
@@ -636,6 +666,13 @@ class OriSelfGuardrails:
             result = result.merge(
                 self.verify_report_html_shape(action.converge_output.report_html)
             )
+            # v2.3 · HTML 里每处 4 字母 MBTI 串必须等于派生 mbti_type
+            result = result.merge(
+                self.verify_report_html_consistency(
+                    action.converge_output.report_html,
+                    action.converge_output.mbti_type or "",
+                )
+            )
             readiness = self.check_convergence_readiness(session)
             if not readiness.passed and session.round_count < MAX_ROUNDS:
                 result = result.merge(readiness)
@@ -652,6 +689,80 @@ FALLBACK_NEXT_PROMPT = (
     "我先换一个角度。最近一次让你印象最深的一件小事是什么？—— "
     "不用是大事，上周的一杯咖啡、一次通勤、一场饭局都算。"
 )
+
+# v2.3 · 每维度的开放问题种子。fallback 根据 reject 里的"缺失维度"挑一条，
+# 让 LLM 下一轮有机会抽到该维度的 evidence，跳出死循环。
+#
+# 设计：不用"禁止做 X"而用"提议换个角度问 X"——fallback 输出合法且
+# 能推进状态。具体措辞尽量贴朋友口吻，避免问卷腔。
+_DIMENSION_SEEDS: Dict[str, List[str]] = {
+    "E/I": [
+        "说一件你最近一个人在家待了半天的事——那段时间你是觉得满还是觉得闷？",
+        "上次跟人聊完天，你是觉得被充满了，还是需要缓一阵？",
+        "你最近一次很想找人说话、但又没找的时刻是什么样的？",
+    ],
+    "S/N": [
+        "你给我讲一个你最近注意到的小细节吧——别人可能都没留意那种。",
+        "如果今天脑子里有个念头反复冒出来，是什么？",
+        "你更容易被一个具体的场景打动，还是被一句话、一个想法打动？",
+    ],
+    "T/F": [
+        "上次做一个不太好选的决定，你是先想通了再定，还是先有了感觉再去圆它？",
+        "有人跟你抱怨一件事，你下意识想做什么——先帮 TA 想办法，还是先陪 TA 待着？",
+        "你最近一次在「该说实话还是照顾对方感受」之间犹豫，是什么事？",
+    ],
+    "J/P": [
+        "明天如果一整天没安排，你会提前想好干嘛，还是醒来再说？",
+        "上次计划被打乱你什么反应——马上重排，还是先放着走走看？",
+        "你的书桌 / 手机桌面更像「每样东西有位置」还是「能用就行」？",
+    ],
+}
+
+_DIM_MISSING_RE = re.compile(r"missing dimensions \[([^\]]+)\]")
+_DIM_TOKEN_RE = re.compile(r"'([EI][/]?[IS]?[/]?[NFJP])'|\"([EISNTFJP/]+)\"")
+
+
+def _extract_missing_dimensions(reasons: Sequence[str]) -> List[str]:
+    """从 convergence readiness 的 reject 文案里抽出 missing 维度列表。
+
+    样本输入："convergence not ready: missing dimensions ['E/I', 'J/P'] (...)"
+    样本输出：["E/I", "J/P"]
+
+    用独立函数是为了可测 —— fallback 不该依赖 stringly-typed 解析的
+    "恰好能用"，这里把解析抽出来可以单测。
+    """
+    canonical = {"E/I", "S/N", "T/F", "J/P"}
+    found: List[str] = []
+    seen: set[str] = set()
+    for reason in reasons:
+        m = _DIM_MISSING_RE.search(reason)
+        if not m:
+            continue
+        for token in re.findall(r"[EISNTFJP]/[EISNTFJP]", m.group(1)):
+            if token in canonical and token not in seen:
+                seen.add(token)
+                found.append(token)
+    return found
+
+
+def _pick_deficit_seed(dims: Sequence[str], session: Optional[SessionState]) -> tuple[str, str]:
+    """从缺失维度里挑一条种子问题。
+
+    选择策略：取 reject reasons 里出现的第一个维度（避免随机性造成
+    session 行为不可复现）；同一维度内轮换，避免连续 fallback 问同一句。
+    返回 (dimension, prompt)。
+    """
+    dim = dims[0] if dims else "S/N"
+    seeds = _DIMENSION_SEEDS.get(dim) or _DIMENSION_SEEDS["S/N"]
+    # 用 session 里已走过的 fallback 计数做轮换（stable）
+    prev = 0
+    if session is not None:
+        prev = sum(
+            1 for t in session.turns
+            if t.action_type in ("ask", "reflect") and t.dimension_targeted == dim
+        )
+    prompt = seeds[prev % len(seeds)]
+    return dim, prompt
 
 FALLBACK_ONBOARDING_PROMPT = (
     "嗨，我是陪你聊聊天的朋友，不是打分的系统。随便聊聊最近的生活就行，"
@@ -676,8 +787,17 @@ FALLBACK_SOFT_CLOSING_PROMPT = (
 )
 
 
-def fallback_action(round_number: int, session: Optional[SessionState] = None) -> Action:
-    """3 次 retry 都失败时的保底 action。按轮次返回不同的保底语。"""
+def fallback_action(
+    round_number: int,
+    session: Optional[SessionState] = None,
+    reject_reasons: Optional[Sequence[str]] = None,
+) -> Action:
+    """3 次 retry 都失败时的保底 action。
+
+    v2.3：fallback 变得"有方向"——若 reject 原因里含 convergence-not-ready
+    的维度缺口，就挑一条缺失维度的种子开放问题；这样下一轮用户的回答
+    有机会落在缺口维度上，LLM 能抽到新 evidence，跳出死循环。
+    """
     if round_number == ONBOARDING_ROUND:
         return Action(
             action="onboarding",
@@ -711,6 +831,18 @@ def fallback_action(round_number: int, session: Optional[SessionState] = None) -
                 next_prompt=FALLBACK_SOFT_CLOSING_PROMPT,
                 converge_output=None,
             )
+    # v2.3 · deficit-aware：如果 reject 原因含维度缺口，换个角度指向缺口
+    missing_dims = _extract_missing_dimensions(reject_reasons or [])
+    if missing_dims:
+        dim, prompt = _pick_deficit_seed(missing_dims, session)
+        return Action(
+            action="ask",
+            dimension_targeted=dim,  # type: ignore[arg-type]
+            evidence=[],
+            contradiction=None,
+            next_prompt=prompt,
+            converge_output=None,
+        )
     return Action(
         action="ask",
         dimension_targeted="none",

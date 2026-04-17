@@ -10,7 +10,7 @@ Pydantic schemas · 运行时类型校验。
 """
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -113,10 +113,14 @@ class PullQuote(BaseModel):
 
 
 class CardData(BaseModel):
-    """名片结构化数据，前端 Editorial 模板渲染。"""
+    """名片结构化数据，前端 Editorial 模板渲染。
+
+    v2.3：`mbti_type` 改为 Optional — LLM 可以不填，runtime 会从 ConvergeOutput
+    的 confidence_per_dim 派生并覆盖。字母一致性由单一真相源（派生值）保证。
+    """
 
     title: str = Field(min_length=4, max_length=40)
-    mbti_type: str = Field(pattern=r"^[EI][SN][TF][JP]$")
+    mbti_type: Optional[str] = Field(default=None, pattern=r"^[EI][SN][TF][JP]$")
     subtitle: str = Field(max_length=60)
     pull_quotes: List[PullQuote] = Field(max_length=3)
     typography_hint: TypographyHint = "editorial_serif"
@@ -128,18 +132,70 @@ class InsightParagraph(BaseModel):
     quoted_rounds: List[int] = Field(min_length=1)
 
 
+class DimResult(BaseModel):
+    """单维度的判定结果：倾向字母 + 置信度。
+
+    v2.3：把 `mbti_type` 的信息源从"LLM 自行拼接的 4 字母字符串"迁移到
+    这里。LLM 只声明每维度的倾向 + 分数，runtime 派生 4 字母——消除 LLM
+    在多处重复写字母时的飘移幻觉（INFJ vs INFP）。
+    """
+
+    letter: Literal["E", "I", "S", "N", "T", "F", "J", "P"]
+    score: float = Field(ge=0.0, le=1.0)
+
+
+DIM_LETTERS: Dict[str, set[str]] = {
+    "E/I": {"E", "I"},
+    "S/N": {"S", "N"},
+    "T/F": {"T", "F"},
+    "J/P": {"J", "P"},
+}
+
+DIM_ORDER: tuple[str, ...] = ("E/I", "S/N", "T/F", "J/P")
+
+
+def derive_mbti_type(confidence_per_dim: Dict[str, DimResult]) -> str:
+    """从 4 维 DimResult 派生 4 字母 MBTI 类型。唯一真相源。"""
+    missing = [d for d in DIM_ORDER if d not in confidence_per_dim]
+    if missing:
+        raise ValueError(
+            f"confidence_per_dim 缺少维度 {missing}，"
+            f"必须提供 {list(DIM_ORDER)} 全部四项"
+        )
+    letters: List[str] = []
+    for dim in DIM_ORDER:
+        dr = confidence_per_dim[dim]
+        if dr.letter not in DIM_LETTERS[dim]:
+            raise ValueError(
+                f"confidence_per_dim['{dim}'].letter='{dr.letter}' "
+                f"不在合法集合 {DIM_LETTERS[dim]} 内"
+            )
+        letters.append(dr.letter)
+    return "".join(letters)
+
+
 class ConvergeOutput(BaseModel):
-    """v2.2：交付物升级为自包含 HTML 页面。
+    """v2.3：交付物自包含 HTML + 单一真相源的 MBTI 派生。
 
     字段职责：
-    - `report_html` · 最终交付物，完整自包含 HTML（<!DOCTYPE ...</html>），
-      用于发给用户（本地 agent 起 localhost 渲染；云端 agent 把字符串返给前端即可）。
-    - `insight_paragraphs` · 保留为**结构性 grounding 证据**（guardrails 仍做
-      quoted_rounds / body 长度校验）。HTML 里的内容应该由这 3 段扩写。
-    - `card` · 保留名片元数据（HTML 里可视化，也可供分享图生成）。
+    - `confidence_per_dim` · **单一真相源**。LLM 填每维度的倾向字母 + 置信度。
+    - `mbti_type` · 由 `confidence_per_dim` 派生，LLM 可以不填；若填了，
+      必须等于派生值（validator 会覆盖/校验）。
+    - `report_html` · 完整自包含 HTML。里面出现的任何 4 字母 MBTI 串必须
+      全都等于派生 mbti_type（guardrails 独立校验）。
+    - `insight_paragraphs` · 3 段洞见。保留结构性 grounding：每段引用的
+      `quoted_rounds` 必须是真实轮。
+    - `card` · 名片元数据；`card.mbti_type` 同样由 validator 对齐派生值。
     """
-    mbti_type: str = Field(pattern=r"^[EI][SN][TF][JP]$")
-    confidence_per_dim: dict = Field(default_factory=dict)
+    mbti_type: Optional[str] = Field(
+        default=None,
+        pattern=r"^[EI][SN][TF][JP]$",
+        description="若填了必须等于 confidence_per_dim 派生值；不填 runtime 派生。",
+    )
+    confidence_per_dim: Dict[str, DimResult] = Field(
+        default_factory=dict,
+        description="必须包含 E/I, S/N, T/F, J/P 四个键，每个是 {letter, score}。",
+    )
     insight_paragraphs: List[InsightParagraph] = Field(min_length=3, max_length=3)
     card: CardData
     report_html: str = Field(
@@ -158,6 +214,80 @@ class ConvergeOutput(BaseModel):
         if "<html" not in low or "</html>" not in low:
             raise ValueError("report_html 必须包含完整 <html>...</html>")
         return text
+
+    @model_validator(mode="before")
+    @classmethod
+    def _synth_confidence_from_mbti(cls, data):
+        """向后兼容：统一接受两种旧格式 → 升级为新结构化 DimResult。
+
+        支持的输入形态：
+        1. 新：{"E/I": {"letter": "I", "score": 0.7}, ...}  ← 首选
+        2. 旧：{"E/I": 0.7, ...}（flat float）+ mbti_type="INTJ"
+           → letter 从 mbti_type 对应位取，score 用 float
+        3. 仅有 mbti_type="INTJ"，无 confidence_per_dim
+           → 全部按默认 score=0.7 合成
+
+        不合法的输入（DimResult 校验失败）会在后续 model_validate 报错。
+        """
+        if not isinstance(data, dict):
+            return data
+        cpd = data.get("confidence_per_dim")
+        mt = data.get("mbti_type")
+        letters_from_mt: Dict[str, str] = {}
+        if mt and isinstance(mt, str) and len(mt) == 4:
+            letters_from_mt = dict(zip(DIM_ORDER, mt))
+
+        if not cpd:
+            # 形态 3
+            if letters_from_mt:
+                data = dict(data)
+                data["confidence_per_dim"] = {
+                    dim: {"letter": letter, "score": 0.7}
+                    for dim, letter in letters_from_mt.items()
+                }
+            return data
+
+        # 形态 2：flat float → {letter, score}
+        if isinstance(cpd, dict) and any(
+            isinstance(v, (int, float)) and not isinstance(v, bool)
+            for v in cpd.values()
+        ):
+            upgraded: Dict[str, dict] = {}
+            for dim, val in cpd.items():
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    letter = letters_from_mt.get(dim)
+                    if letter is None:
+                        # 实在没线索 → 取维度第一个字母作占位（E/I → E）
+                        letter = dim.split("/")[0]
+                    upgraded[dim] = {"letter": letter, "score": float(val)}
+                else:
+                    upgraded[dim] = val
+            data = dict(data)
+            data["confidence_per_dim"] = upgraded
+        return data
+
+    @model_validator(mode="after")
+    def _align_mbti_type_with_confidence(self) -> "ConvergeOutput":
+        """派生权威 mbti_type，覆盖 LLM 自己写的字段，并对齐 card.mbti_type。
+
+        设计：LLM 在 confidence_per_dim + mbti_type + card.mbti_type + HTML
+        四处都可能写字母，冲突几乎必然发生。这里让 confidence_per_dim 成
+        为单一真相源——其他地方若不一致，以派生值为准（覆盖）。HTML 里
+        的字面一致性由 guardrails 独立校验（post-hoc）。
+        """
+        derived = derive_mbti_type(self.confidence_per_dim)
+        if self.mbti_type is not None and self.mbti_type != derived:
+            # 不抛错——容忍 LLM 的小飘移，以派生值覆盖
+            pass
+        # 用 object.__setattr__ 绕过 pydantic 的 frozen 保护（这里不是 frozen，但
+        # 用 = 赋值会再触发 validator，造成递归；用 __dict__ 直接写）
+        object.__setattr__(self, "mbti_type", derived)
+        object.__setattr__(
+            self.card,
+            "mbti_type",
+            derived,
+        )
+        return self
 
 
 class Action(BaseModel):

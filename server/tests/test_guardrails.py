@@ -20,10 +20,7 @@ from oriself_server.schemas import (
 from oriself_server.skill_loader import clear_cache, load_skill_bundle
 
 
-SKILL_ROOT = (
-    Path(__file__).resolve().parent.parent.parent
-    / "skill-repo" / "skills" / "oriself"
-)
+SKILL_ROOT = Path(__file__).resolve().parent.parent.parent / "skill-repo" / "skills" / "oriself"
 
 
 @pytest.fixture(autouse=True)
@@ -379,8 +376,14 @@ def test_validate_action_happy(guard, fake_session):
     assert r.passed, f"reasons: {r.reasons}"
 
 
-def test_validate_action_rejects_historical_evidence(guard, fake_session):
-    """HARD-GATE 12 · evidence.round_number 必须 = current_round。"""
+def test_validate_action_allows_honest_historical_evidence(guard, fake_session):
+    """v2.3 · 回引历史轮合法。
+
+    设计转向：放开 `round_number == current_round` 硬约束。
+    只要 quote 是 round_number 对应那轮 user_message 的字面子串，就放行。
+    这解除 LLM "被迫说谎"（硬锁下若想引旧 quote 只能谎报当前轮）。
+    去重靠 advance_state 层的 (dimension, user_quote) set，不会虚增计数。
+    """
     action = Action(
         action="ask",
         dimension_targeted="E/I",
@@ -388,7 +391,26 @@ def test_validate_action_rejects_historical_evidence(guard, fake_session):
             Evidence(
                 dimension="E/I",
                 user_quote="第1轮的具体回答内容",
-                round_number=1,  # 历史轮，应被拒
+                round_number=1,  # 历史轮，v2.3 允许
+                confidence=0.6,
+            )
+        ],
+        next_prompt="上周有没有一个具体的时刻让你印象很深?",
+    )
+    r = guard.validate_action(action, fake_session, round_number=21)
+    assert r.passed, f"reasons: {r.reasons}"
+
+
+def test_validate_action_rejects_historical_evidence_with_wrong_quote(guard, fake_session):
+    """v2.3 · 回引历史轮但 quote 不是那轮的字面子串 → 仍然 reject。"""
+    action = Action(
+        action="ask",
+        dimension_targeted="E/I",
+        evidence=[
+            Evidence(
+                dimension="E/I",
+                user_quote="这段话根本没出现过",
+                round_number=1,
                 confidence=0.6,
             )
         ],
@@ -396,7 +418,7 @@ def test_validate_action_rejects_historical_evidence(guard, fake_session):
     )
     r = guard.validate_action(action, fake_session, round_number=21)
     assert not r.passed
-    assert any("must equal current round" in rea for rea in r.reasons)
+    assert any("字面子串" in rea for rea in r.reasons)
 
 
 def test_validate_action_banned_in_prompt(guard, fake_session):

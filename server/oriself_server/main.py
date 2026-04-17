@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__
 from .database import init_db
+from .routes.feedback import router as feedback_router
 from .routes.issues import router as issues_router
 from .routes.letters import router as letters_router
 
@@ -47,6 +48,7 @@ def create_app() -> FastAPI:
 
     app.include_router(letters_router)
     app.include_router(issues_router)
+    app.include_router(feedback_router)
 
     @app.on_event("startup")
     def _startup():

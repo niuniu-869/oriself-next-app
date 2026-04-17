@@ -241,7 +241,17 @@ class SkillRunner:
             if ev.dimension in dim_counts:
                 dim_counts[ev.dimension] += 1
         weakest = min(dim_counts.items(), key=lambda x: x[1])
-        dim_summary = ", ".join(f"{d}={c}" for d, c in dim_counts.items())
+        # v2.3：用符号体现"饱满/缺口"，比光看数字更直观——让 LLM 一眼
+        # 看见哪些维度已经够 (>=3)、哪些还缺。这是 **信号注入**，不是禁令。
+        dim_summary = ", ".join(
+            f"{d}={c}{'✓' if c >= 3 else '·缺'}" for d, c in dim_counts.items()
+        )
+        deficit_dims = [d for d, c in dim_counts.items() if c < 3]
+        deficit_hint = (
+            f"\n- 距离收敛还缺：{deficit_dims}（每维度 ≥3 条才能收敛）"
+            if deficit_dims else
+            "\n- 四维证据已齐（每维度 ≥3 条），可以准备收敛。"
+        )
 
         # 软观察（只提供信息，不强制 action）
         emo = observe_emotional_hint(user_message)
@@ -293,6 +303,9 @@ class SkillRunner:
             f"- today_cn：{today.year} 年 {today.month} 月 {today.day} 日"
         )
 
+        # v2.3 · runtime_hint 改走**正向描述**（"输出形式是 X"）而不是
+        # "不要做 X"。负向指令 LLM 反而更容易注意到违禁词；正向锚定
+        # 输出结构，让"合法输出"成为默认路径。
         runtime_hint = (
             f"\n\n---\n\n# Runtime State\n"
             f"- 当前轮：R{current_round}\n"
@@ -301,36 +314,65 @@ class SkillRunner:
             f"- 期望轮数（soft target）：{target_rounds}\n"
             f"- 中期回顾轮：R{midpoint_round(target_rounds)}\n"
             f"- 尾声提醒轮：R{near_end_round(target_rounds)}\n"
-            f"- 每维度证据数：{dim_summary}\n"
+            f"- 每维度证据：{dim_summary}"
+            f"{deficit_hint}\n"
             f"- 目前最弱维度：{weakest[0]}（{weakest[1]} 条）"
             f"{meta_lines}"
             f"{signal_note}{prefs_note}{quiz_hint}\n\n"
-            f"**本轮输出要求**：严格符合 ACTION JSON SCHEMA 的 JSON object。"
-            f"不要输出 markdown fence，不要输出 JSON 外的文字。"
-            f"`evidence[*].round_number` 若有，必须等于当前轮 R{current_round}。"
-            f"\n\n**converge HTML 的元信息必须用 Runtime State 里的真实值**——"
-            f"不要留 `{{{{session_id}}}}` `{{{{date}}}}` 这类模板占位符。"
-            f"session 短号用 `{session_id_short}`，今天日期按风格选 "
-            f"`{today.isoformat()}` / `{today.strftime('%b %d, %Y')}` / "
-            f"`{today.year} 年 {today.month} 月 {today.day} 日`。"
+            f"# 本轮输出契约\n\n"
+            f"**形式**：一个 JSON object，以 `{{` 开始、`}}` 结束，全程无额外文字、"
+            f"无 markdown fence。\n\n"
+            f"**evidence 的 round_number 是忠实标注**：若本轮 quote 从 R{current_round} "
+            f"user_message 抽，填 {current_round}；若回引历史轮的原话（做 reflect/probe "
+            f"的 contextual quote），就填那一真实轮号。quote 本身必须是该轮 "
+            f"user_message 的字面子串。\n\n"
+            f"**converge 的字母一致性**（仅 converge 轮）：MBTI 4 字母的单一真相源是 "
+            f"`confidence_per_dim[*].letter`——runtime 会从这里派生 `mbti_type`。"
+            f"`report_html` 里出现任何 4 字母 MBTI 串时，请与 "
+            f"`confidence_per_dim` 派生值保持字面一致（方法：先在脑子里拼好 4 字母，"
+            f"再在 HTML 里**只用那一个字符串**，无论出现在 title / meta / footer 都同一个）。\n\n"
+            f"**converge HTML 的元值**：用下面的真实值直接写进 HTML。\n"
+            f"  - session 短号：`{session_id_short}`\n"
+            f"  - 今天日期可选风格：`{today.isoformat()}` / "
+            f"`{today.strftime('%b %d, %Y')}` / "
+            f"`{today.year} 年 {today.month} 月 {today.day} 日`"
         )
 
         msgs: List[Message] = [
             Message(role="system", content=system_prompt + runtime_hint, cache_breakpoint=True),
         ]
 
-        # 历史：quiz 轮用户消息压缩成摘要
+        # v2.3 · 历史轮和当前轮用结构化 tag 隔离。
+        # 过去的观察：LLM 把 R14 的原话当 R16 塞进本轮 evidence。根因是
+        # prompt 里 `[Rn] msg` 这种平铺格式让 LLM 把所有历史轮当"流水帐"，
+        # 对"本轮 anchor"感知不强。解法：历史轮打 <history_turn>，当前
+        # 轮打 <current_turn> + 系统 message 末尾再次 anchor。
         for t in session.turns:
             user_msg_text = t.user_message
             if t.action_type == "scenario_quiz" or user_msg_text.strip().startswith("<quiz_answers"):
-                # 如果是 quiz 回合的用户答复，压缩
                 user_msg_text = compress_quiz_answer(user_msg_text)
             msgs.append(
-                Message(role="user", content=f"[R{t.round_number}] {user_msg_text}")
+                Message(
+                    role="user",
+                    content=(
+                        f'<history_turn round="{t.round_number}">\n'
+                        f"{user_msg_text}\n"
+                        f"</history_turn>"
+                    ),
+                )
             )
 
-        # 本轮新消息
-        msgs.append(Message(role="user", content=f"[R{current_round}] {user_message}"))
+        # 本轮新消息 · 独立 anchor。
+        msgs.append(
+            Message(
+                role="user",
+                content=(
+                    f'<current_turn round="{current_round}">\n'
+                    f"{user_message}\n"
+                    f"</current_turn>"
+                ),
+            )
+        )
         return msgs
 
     # ------------------------------------------------------------------
@@ -418,7 +460,11 @@ class SkillRunner:
             last_reasons,
         )
         return TurnResult(
-            action=fallback_action(round_number, session),
+            action=fallback_action(
+                round_number,
+                session,
+                reject_reasons=last_reasons,
+            ),
             retries=MAX_RETRIES,
             used_fallback=True,
             guardrail_reasons=last_reasons,

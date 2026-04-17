@@ -132,3 +132,29 @@ class TestResult(Base):
     created_at = Column(DateTime, default=_utcnow)
 
     session = relationship("TestSession", back_populates="result")
+
+
+class Feedback(Base):
+    """用户反馈。匿名可，可选关联到一封信 / 一个 issue。
+
+    设计哲学：反馈是单向投递通道，不需要回复链；不强制邮箱，但允许留邮箱以便回访。
+    rating 是 1-5 整数（1=差 5=好），text 是自由表述（≤2000 字）。
+    """
+
+    __tablename__ = "feedbacks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # 关联信 / issue（可空：landing 页也可投递反馈）
+    letter_id = Column(String(36), ForeignKey("test_sessions.session_id"), nullable=True)
+    issue_slug = Column(String(32), nullable=True, index=True)
+
+    rating = Column(Integer, nullable=True)  # 1-5
+    text = Column(Text, nullable=False)
+    contact = Column(String(200), nullable=True)  # 可选邮箱 / 微信
+    user_agent = Column(String(500), nullable=True)
+
+    created_at = Column(DateTime, default=_utcnow, index=True)
+
+    __table_args__ = (
+        Index("ix_feedback_letter", "letter_id"),
+    )

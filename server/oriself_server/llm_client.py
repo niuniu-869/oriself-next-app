@@ -33,6 +33,24 @@ class Message:
     cache_breakpoint: bool = False  # 预留给未来 Anthropic cache_control
 
 
+# v2.3 · 把 user_message 用 <current_turn>/<history_turn> tag 包了之后，
+# 某些工具（mock、测试）需要拿到去 tag 的原文。这里提供一个小解包函数。
+_TURN_TAG_RE = re.compile(
+    r"^\s*<(current|history)_turn[^>]*>\s*([\s\S]*?)\s*</(current|history)_turn>\s*$"
+)
+
+
+def _unwrap_turn_tag(content: str) -> str:
+    """如果 content 是 <current_turn>...</current_turn> 结构，返回内部文本。
+
+    否则原样返回（兼容历史数据 / 非 tag 格式）。
+    """
+    if not content:
+        return content
+    m = _TURN_TAG_RE.match(content)
+    return m.group(2) if m else content
+
+
 # ---------------------------------------------------------------------------
 # 基础接口
 # ---------------------------------------------------------------------------
@@ -143,7 +161,9 @@ class MockBackend(LLMBackend):
         # 从 messages 里估算当前是第几轮（user 消息个数）
         user_rounds = [m for m in messages if m.role == "user"]
         current_round = len(user_rounds)
-        last_user_message = user_rounds[-1].content if user_rounds else ""
+        last_user_message = _unwrap_turn_tag(
+            user_rounds[-1].content if user_rounds else ""
+        )
         return self._script_action(current_round, last_user_message, messages)
 
     def _script_action(
@@ -199,7 +219,9 @@ class MockBackend(LLMBackend):
 
     def _build_converge(self, messages: List[Message]) -> dict:
         # 从所有 user 消息拿前 3 条做 pull_quotes & insight 引用
-        user_msgs = [m.content for m in messages if m.role == "user"]
+        # v2.3：user content 现在被 <current_turn>/<history_turn> tag 包裹，
+        # 要 strip 掉 anchor tag 才能拿到真实内容。
+        user_msgs = [_unwrap_turn_tag(m.content) for m in messages if m.role == "user"]
         pulls = []
         rounds_cited = []
         for i, msg in enumerate(user_msgs[:3], start=1):
