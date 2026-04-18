@@ -1,4 +1,4 @@
-import Link from 'next/link';
+import Link from "next/link";
 
 /**
  * Landing · 作品集风格。
@@ -15,13 +15,13 @@ export default function LandingPage() {
         <h1
           className="text-ink text-center"
           style={{
-            fontFamily: 'var(--font-serif)',
+            fontFamily: "var(--font-serif)",
             fontVariationSettings: '"opsz" 144, "SOFT" 100, "WONK" 1',
-            fontStyle: 'italic',
+            fontStyle: "italic",
             fontWeight: 400,
-            fontSize: 'clamp(96px, 18vw, 220px)',
+            fontSize: "clamp(96px, 18vw, 220px)",
             lineHeight: 0.92,
-            letterSpacing: '-0.045em',
+            letterSpacing: "-0.045em",
           }}
         >
           OriSelf
@@ -44,15 +44,34 @@ export default function LandingPage() {
       {/* Colophon — barely visible, edge of the page */}
       <footer className="px-8 pb-8 pt-16">
         <div className="max-w-[1200px] mx-auto flex justify-between items-baseline font-mono text-[10px] tracking-widest uppercase text-ink-muted">
-          <span>OriSelf · Issue 04 · v2.2.3</span>
-          <a
-            href="https://github.com/niuniu-869/oriself-next-app"
-            className="hover:text-accent transition-colors"
-            target="_blank"
-            rel="noopener"
-          >
-            Apache 2.0
-          </a>
+          <span>OriSelf · Issue 04 · v2.4.0</span>
+          <div className="flex items-baseline gap-[14px]">
+            <a
+              href="https://github.com/niuniu-869/oriself-next"
+              className="hover:text-accent transition-colors"
+              target="_blank"
+              rel="noopener"
+              aria-label="Skill 仓库 · GitHub"
+            >
+              Skill ↗
+            </a>
+            <span aria-hidden className="opacity-40">
+              ·
+            </span>
+            <a
+              href="https://github.com/niuniu-869/oriself-next-app"
+              className="hover:text-accent transition-colors"
+              target="_blank"
+              rel="noopener"
+              aria-label="App 仓库 · GitHub"
+            >
+              App ↗
+            </a>
+            <span aria-hidden className="opacity-40">
+              ·
+            </span>
+            <span>Apache 2.0</span>
+          </div>
         </div>
       </footer>
     </main>
