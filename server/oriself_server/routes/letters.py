@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 from ..database import get_sessionmaker
 from ..llm_client import make_backend
 from ..models import Conversation, TestResult, TestSession
-from ..schemas import MAX_ROUNDS, UserPreferences
+from ..schemas import MAX_ROUNDS, MIN_CONVERGE_ROUND, UserPreferences
 from ..skill_loader import load_skill_bundle
 from ..skill_runner import (
     ReportRunner,
@@ -297,6 +297,18 @@ async def _stream_turn_core(
     if not visible:
         visible = raw_accum.strip()
 
+    # 护栏：LLM 偶发过早声明 CONVERGE（R6 之前）→ 静默降级为 CONTINUE。
+    # 不降级则 R2 就触发报告生成、sess 被置 completed，前端跳 issue 页，
+    # 从用户视角就是"刚发第二句就再也无法输入"。
+    current_round = state.round_count + 1
+    if status == "CONVERGE" and current_round < MIN_CONVERGE_ROUND:
+        logger.info(
+            "suppressed early CONVERGE at round=%d (<MIN_CONVERGE_ROUND=%d)",
+            current_round,
+            MIN_CONVERGE_ROUND,
+        )
+        status = "CONTINUE"
+
     try:
         round_number = _persist_turn(db, sess, user_message, raw_accum, visible, status)
     except HTTPException as he:
@@ -470,8 +482,14 @@ async def compose_result(letter_id: str, db: Session = Depends(get_db)):
         )
 
     state = _load_session_state(db, letter_id)
-    if state.round_count < 2:
-        raise HTTPException(status_code=400, detail="对话轮数太少，还没法写报告")
+    if state.round_count < MIN_CONVERGE_ROUND:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"对话只有 {state.round_count} 轮，至少 "
+                f"{MIN_CONVERGE_ROUND} 轮才能写报告"
+            ),
+        )
 
     bundle = load_skill_bundle()
     backend = make_backend(sess.provider)

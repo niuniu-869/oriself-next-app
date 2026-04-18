@@ -22,6 +22,9 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 MAX_ROUNDS = 30              # 硬上限：到 R30 服务端强制 converge
 DEFAULT_TARGET_ROUNDS = 20   # 用户没说时的默认
 ONBOARDING_ROUND = 1
+MIN_CONVERGE_ROUND = 6       # 最低收束轮数，与 SKILL.md 铁则对齐；
+                             # 低于此轮号的 CONVERGE 一律被服务端降级为 CONTINUE，
+                             # 避免 LLM 偶发早收束让用户"R2 就跳报告页"
 REPORT_MAX_RETRIES = 3       # 报告生成最多重试 3 次
 
 
