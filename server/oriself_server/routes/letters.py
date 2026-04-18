@@ -29,6 +29,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -378,7 +379,17 @@ async def rewrite_last_turn(
 
     original_user_message = last.user_message
     last.discarded = True
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        # 防御旧数据库仍然带 uq_session_round_discarded 索引的情况：
+        # 第二次重写同一轮会在这里撞约束。回滚并返 409，前端把它当成"再试一下"。
+        db.rollback()
+        logger.warning("rewrite commit failed (likely legacy unique index): %s", exc)
+        raise HTTPException(
+            status_code=409,
+            detail="重写冲突 —— 请重新部署时确认已跑迁移（DROP INDEX uq_session_round_discarded）",
+        ) from exc
 
     return StreamingResponse(
         _stream_turn_core(db, sess, original_user_message, rewrite_hint=req.hint),

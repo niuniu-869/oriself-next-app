@@ -23,7 +23,6 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
-    UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -86,12 +85,12 @@ class Conversation(Base):
     session = relationship("TestSession", back_populates="conversations")
 
     __table_args__ = (
-        # (session_id, round_number) 仍可唯一——但 discarded 的旧轮会共享 round_number
-        # 所以约束改为 (session_id, round_number, discarded)，允许一个 active + 多个 discarded
-        UniqueConstraint(
-            "session_id", "round_number", "discarded",
-            name="uq_session_round_discarded",
-        ),
+        # 同一 (session_id, round_number) 允许：
+        #   · 最多一条 active（discarded=False）—— 由 `_persist_turn` 在应用层去重
+        #   · 任意条 discarded（每次用户点「重写」都会产生一条）
+        # 过去这里有 UniqueConstraint(session_id, round_number, discarded)，
+        # 但它把"任意条 discarded"也限成了一条 → 第二次重写同一轮时触发
+        # IntegrityError → 500。应用层检查已经够，DB 层不再兜底。
         Index("ix_conv_session_round_desc", "session_id", "round_number"),
         Index("ix_conv_session_status", "session_id", "status_sentinel"),
     )

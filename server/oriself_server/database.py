@@ -47,7 +47,23 @@ def get_sessionmaker() -> sessionmaker:
 def init_db() -> None:
     from .models import Base
 
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+
+    # 一次性迁移：v2.4.x 之前 conversations 上有一个
+    # UniqueConstraint(session_id, round_number, discarded)，错误地把同一
+    # round 的 discarded 记录也限成一条，导致用户第二次「重写同一轮」时
+    # commit 触发 IntegrityError → 500。新代码把它拆了，这里把遗留索引也
+    # drop 掉。DROP INDEX IF EXISTS 在新库 / 已 drop 过的库上无副作用。
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "DROP INDEX IF EXISTS uq_session_round_discarded"
+            )
+    except Exception:
+        # 迁移失败不阻断启动——旧索引仍然存在时只影响"第二次重写同一轮"这一路径。
+        pass
+
+    Base.metadata.create_all(bind=engine)
 
 
 @contextmanager
