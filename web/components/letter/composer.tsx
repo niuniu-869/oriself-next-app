@@ -139,7 +139,11 @@ export function Composer({ onSend, disabled, draftKey }: Props) {
 
   return (
     <footer
-      className="fixed left-0 right-0 bottom-0 z-[8] px-8 pt-20 pb-9 pointer-events-none"
+      // z-20 > main 的 z-10 —— 第 2 轮之后 main 内容撑到视口底部时，
+      // main 的 pb-[260px] padding 区域会堆在 composer 上面抢走点击
+      // （composer 自己 pointer-events-none，但内层 textarea 的 pointer-events-auto
+      // 区域需要比 main 高才能稳定接收点击）。
+      className="fixed left-0 right-0 bottom-0 z-20 px-8 pt-20 pb-9 pointer-events-none"
       style={{
         background:
           "linear-gradient(to top, var(--paper) 55%, rgba(245, 240, 230, 0.92) 80%, rgba(245, 240, 230, 0))",
