@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { RecentLetters } from "@/components/home/recent-letters";
 
 /**
  * Landing · 作品集风格。
@@ -40,6 +41,9 @@ export default function LandingPage() {
           进入 →
         </Link>
       </section>
+
+      {/* Recent letters · local-only, shown only if there are entries */}
+      <RecentLetters />
 
       {/* Colophon — barely visible, edge of the page */}
       <footer className="px-8 pb-8 pt-16">

@@ -1,6 +1,7 @@
 import { notFound } from "next/navigation";
 import { getIssue } from "@/lib/api";
 import { IssueChrome } from "@/components/issue/issue-chrome";
+import { HistorySync } from "@/components/history/history-sync";
 
 /**
  * /issues/:slug · the report page.
@@ -48,6 +49,17 @@ export default async function IssuePage({
         initialIsPublic={meta.is_public}
         letterId={meta.letter_id ?? undefined}
       />
+
+      {/* 直接访问报告链接时，补齐本地历史 */}
+      {meta.letter_id && (
+        <HistorySync
+          letterId={meta.letter_id}
+          status="completed"
+          issueSlug={meta.slug}
+          mbtiType={meta.mbti_type}
+          cardTitle={meta.title}
+        />
+      )}
 
       {/* Hidden heading for accessibility / crawlers */}
       <h1 className="sr-only">{meta.title} · OriSelf Issue</h1>

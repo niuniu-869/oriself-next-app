@@ -6,11 +6,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Masthead } from "@/components/masthead";
 import { Composer } from "@/components/letter/composer";
 import { Turn } from "@/components/letter/turn";
-import {
-  composeResult,
-  rewriteLastTurn,
-  sendTurnStream,
-} from "@/lib/api";
+import { composeResult, rewriteLastTurn, sendTurnStream } from "@/lib/api";
+import { upsertLetter } from "@/lib/history";
 import type { LetterState, TurnRecord, TurnStatus } from "@/lib/types";
 
 interface Props {
@@ -33,7 +30,12 @@ interface Props {
  *  - LLM 在流末尾声明 STATUS: CONVERGE → 服务端剥除；前端收到 done.status=CONVERGE
  *    自动触发报告生成并跳 /issues/:slug。
  */
-export function LetterView({ letterId, initialState, issueSlug, initialTurns }: Props) {
+export function LetterView({
+  letterId,
+  initialState,
+  issueSlug,
+  initialTurns,
+}: Props) {
   const router = useRouter();
   const isCompleted = initialState.status === "completed";
 
@@ -49,6 +51,20 @@ export function LetterView({ letterId, initialState, issueSlug, initialTurns }: 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [turns, isStreaming]);
+
+  // 初始同步 · 让本地历史在进入信件（包括首次进 + 回看）时就有条目
+  useEffect(() => {
+    const maxRound = initialTurns.reduce(
+      (m, t) => (t.round > m ? t.round : m),
+      0,
+    );
+    upsertLetter({
+      letterId,
+      roundCount: maxRound,
+      status: initialState.status === "completed" ? "completed" : "active",
+      issueSlug: issueSlug ?? undefined,
+    });
+  }, [letterId, initialTurns, initialState.status, issueSlug]);
 
   // ============================================================
   // 流式辅助
@@ -73,7 +89,10 @@ export function LetterView({ letterId, initialState, issueSlug, initialTurns }: 
       if (prev.length === 0) return prev;
       const last = prev[prev.length - 1];
       if (last.speaker !== "oriself") return prev;
-      return [...prev.slice(0, -1), { speaker: "oriself", text: visible, round }];
+      return [
+        ...prev.slice(0, -1),
+        { speaker: "oriself", text: visible, round },
+      ];
     });
   }, []);
 
@@ -81,14 +100,24 @@ export function LetterView({ letterId, initialState, issueSlug, initialTurns }: 
     try {
       const result = await composeResult(letterId);
       if (result.issue_slug) {
+        const cardTitle =
+          result.card &&
+          typeof (result.card as { title?: unknown }).title === "string"
+            ? (result.card as { title: string }).title
+            : undefined;
+        upsertLetter({
+          letterId,
+          status: "completed",
+          issueSlug: result.issue_slug,
+          mbtiType: result.mbti_type,
+          cardTitle,
+        });
         router.push(`/issues/${result.issue_slug}`);
       } else {
         setError("报告生成成功但没有 issue slug，请刷新页面");
       }
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "报告生成卡住了，稍后再试",
-      );
+      setError(err instanceof Error ? err.message : "报告生成卡住了，稍后再试");
     }
   }, [letterId, router]);
 
@@ -117,6 +146,11 @@ export function LetterView({ letterId, initialState, issueSlug, initialTurns }: 
         });
         finalizeOriselfTurn(done.visible, done.round);
         setLastStatus(done.status);
+        upsertLetter({
+          letterId,
+          roundCount: done.round,
+          status: "active",
+        });
         if (done.status === "CONVERGE") {
           await handleConverge();
         }
@@ -165,6 +199,11 @@ export function LetterView({ letterId, initialState, issueSlug, initialTurns }: 
       });
       finalizeOriselfTurn(done.visible, done.round);
       setLastStatus(done.status);
+      upsertLetter({
+        letterId,
+        roundCount: done.round,
+        status: "active",
+      });
       if (done.status === "CONVERGE") {
         await handleConverge();
       }
@@ -284,7 +323,8 @@ export function LetterView({ letterId, initialState, issueSlug, initialTurns }: 
 function CompletedFooter({ issueSlug }: { issueSlug: string | null }) {
   return (
     <footer
-      className="fixed left-0 right-0 bottom-0 z-[8] px-8 pt-20 pb-9 pointer-events-none"
+      // z-20 同步 Composer —— 保证"看报告"链接不会被 main 的 pb-padding 盖住
+      className="fixed left-0 right-0 bottom-0 z-20 px-8 pt-20 pb-9 pointer-events-none"
       style={{
         background:
           "linear-gradient(to top, var(--paper) 55%, rgba(245, 240, 230, 0.92) 80%, rgba(245, 240, 230, 0))",
