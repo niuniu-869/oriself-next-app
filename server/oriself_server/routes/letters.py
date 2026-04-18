@@ -1,13 +1,20 @@
 """
-FastAPI routes · 对话（信件）管理。
+FastAPI routes · 对话（信件）管理 · v2.4。
 
-提供：
-- `POST /letters` · 创建新的信件（会话）
-- `POST /letters/{id}/turn` · 每轮对话
-- `GET /letters/{id}/state` · 当前状态
-- `GET /letters/{id}/result` · 收敛后的结果（内部，含 issue slug）
+对话轮契约从结构化 JSON 改为**流式 Markdown + STATUS sentinel**：
+- `POST /letters`                    · 创建新信件
+- `POST /letters/{id}/turn`          · SSE 流式对话（token 逐字推）
+- `POST /letters/{id}/turn/rewrite`  · 标记最近一轮 discarded 后重新流式
+- `POST /letters/{id}/result`        · 触发报告生成（独立 LLM 调用，3 次 retry）
+- `GET  /letters/{id}/state`         · 元数据（round_count / status）
+- `GET  /letters/{id}/transcript`    · 回看对话（只返非 discarded 的轮）
 
-对外品牌统一用 "letter"（一封信），内部 DB / 代码层沿用 "session"。
+对外品牌统一用 "letter"；内部 DB / 代码层沿用 "session"。
+
+SSE 事件：
+- `event: token`  · data `{"delta": "..."}`           · 一个或多个字符
+- `event: done`   · data `{"round": N, "status": "...", "visible": "..."}`
+- `event: error`  · data `{"message": "..."}`
 """
 from __future__ import annotations
 
@@ -27,25 +34,25 @@ from sqlalchemy.orm import Session
 logger = logging.getLogger(__name__)
 
 from ..database import get_sessionmaker
-from ..guardrails import OriSelfGuardrails, SessionState, Turn
 from ..llm_client import make_backend
-from ..models import Conversation, EvidenceRecord, TestResult, TestSession
-from ..schemas import Evidence
+from ..models import Conversation, TestResult, TestSession
+from ..schemas import MAX_ROUNDS, UserPreferences
 from ..skill_loader import load_skill_bundle
-from ..skill_runner import SkillRunner
+from ..skill_runner import (
+    ReportRunner,
+    SessionState,
+    Turn,
+    TurnRunner,
+    _parse_preferences_heuristic,
+)
 from ..utils.html_sanitize import escape_user_quote, sanitize_report_html
 
 
-def _generate_issue_slug(mbti_type: str) -> str:
-    """生成公开分享 URL 的 slug，形如 'intj-a94b2c'。
-
-    格式 = {mbti 小写}-{6 位 hex}，16^6 = 1.67e7 种组合；
-    DB 层 UNIQUE 约束保底，极端情况重试。
-    """
-    return f"{mbti_type.lower()}-{secrets.token_hex(3)}"
-
-
 router = APIRouter(prefix="/letters", tags=["letters"])
+
+
+def _generate_issue_slug(mbti_type: str) -> str:
+    return f"{mbti_type.lower()}-{secrets.token_hex(3)}"
 
 
 # ---------------------------------------------------------------------------
@@ -69,28 +76,20 @@ class TurnRequest(BaseModel):
     user_message: str = Field(min_length=1, max_length=4000)
 
 
-class TurnResponse(BaseModel):
-    round_number: int
-    action: dict
-    used_fallback: bool
-    retries: int
-    guardrail_reasons: List[str] = Field(default_factory=list)
+class RewriteRequest(BaseModel):
+    hint: Optional[str] = Field(default=None, max_length=500)
 
 
 class StateResponse(BaseModel):
     letter_id: str
     round_count: int
-    status: str
-    evidence_count_per_dim: dict
+    status: str             # active | completed | failed
+    last_status: Optional[str] = None  # 最近一轮的 STATUS sentinel
+    has_report: bool = False
+    issue_slug: Optional[str] = None
 
 
 class TranscriptTurn(BaseModel):
-    """单条可见 turn — 给 /transcript 用。
-
-    一轮对话会拆成两条：先 you（用户原话）、再 oriself（可见回应）。
-    converge 轮如果没有可见文本，留一句兜底 "信收束了，正在写报告……"。
-    """
-
     speaker: str  # "you" | "oriself"
     text: str
     round: int
@@ -100,7 +99,7 @@ class TranscriptResponse(BaseModel):
     letter_id: str
     status: str
     turns: List[TranscriptTurn]
-    issue_slug: Optional[str] = None  # 已 converge 时给个直达报告的链接
+    issue_slug: Optional[str] = None
 
 
 class ResultResponse(BaseModel):
@@ -108,7 +107,7 @@ class ResultResponse(BaseModel):
     mbti_type: str
     insight_paragraphs: list
     card: dict
-    issue_slug: Optional[str] = None  # 收敛后生成的报告 slug（若已生成）
+    issue_slug: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -132,48 +131,36 @@ def _load_session_state(db: Session, session_id: str) -> SessionState:
     convs = (
         db.query(Conversation)
         .filter(Conversation.session_id == session_id)
-        .order_by(Conversation.round_number.asc())
+        .order_by(Conversation.round_number.asc(), Conversation.id.asc())
         .all()
     )
     turns: List[Turn] = []
     for c in convs:
-        ev: List[Evidence] = []
-        if c.action_json:
-            try:
-                data = json.loads(c.action_json)
-                for e in data.get("evidence", []):
-                    ev.append(Evidence.model_validate(e))
-            except Exception:
-                ev = []
         turns.append(
             Turn(
                 round_number=c.round_number,
                 user_message=c.user_message,
-                action_type=c.action_type,
-                evidence=ev,
+                oriself_text=c.oriself_text or "",
+                status=c.status_sentinel or "CONTINUE",
+                discarded=bool(c.discarded),
             )
         )
-    collected: List[Evidence] = []
-    for rec in db.query(EvidenceRecord).filter(EvidenceRecord.session_id == session_id).all():
-        collected.append(
-            Evidence(
-                dimension=rec.dimension,
-                user_quote=rec.user_quote,
-                round_number=rec.round_number,
-                confidence=rec.confidence or 0.5,
-                interpretation=rec.interpretation or "",
-            )
-        )
+    prefs = None
+    if sess.prefs_json:
+        try:
+            prefs = UserPreferences.model_validate_json(sess.prefs_json)
+        except Exception:
+            prefs = None
     return SessionState(
         session_id=session_id,
         domain=sess.domain,
         turns=turns,
-        collected_evidence=collected,
+        user_preferences=prefs,
     )
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Create
 # ---------------------------------------------------------------------------
 
 
@@ -191,214 +178,210 @@ def create_letter(req: CreateLetterRequest, db: Session = Depends(get_db)):
     )
 
 
+# ---------------------------------------------------------------------------
+# Persist helper · 把流完后的一轮落库
+# ---------------------------------------------------------------------------
+
+
 def _persist_turn(
     db: Session,
     sess: TestSession,
     user_message: str,
-    result,  # SkillRunner 的 TurnResult，避免循环 import 这里用 rt 类型省略
-) -> TurnResponse:
-    """把 runner 产出写入 DB，处理 converge 分支，返回对外响应。
-
-    幂等性：同一 round_number 已存在时抛 409。converge 时附带生成 issue。
-    抽成独立函数让同步 / SSE 两条路径都能复用。
-    """
-    session_id = sess.session_id
-    state = _load_session_state(db, session_id)
+    raw_stream: str,
+    visible_text: str,
+    status: str,
+) -> int:
+    """把一轮对话写入 DB；顺便更新 session 状态。返回 round_number。"""
+    state = _load_session_state(db, sess.session_id)
     round_number = state.round_count + 1
 
-    existing = (
+    # 幂等：如果已有活动轮（非 discarded）在这个 round_number，抛 409
+    dup = (
         db.query(Conversation)
         .filter(
-            Conversation.session_id == session_id,
+            Conversation.session_id == sess.session_id,
             Conversation.round_number == round_number,
+            Conversation.discarded.is_(False),
         )
         .first()
     )
-    if existing is not None:
+    if dup is not None:
         raise HTTPException(
             status_code=409,
-            detail=f"round {round_number} already exists (session stale?)",
+            detail=f"round {round_number} already exists",
         )
 
     conv = Conversation(
-        session_id=session_id,
+        session_id=sess.session_id,
         round_number=round_number,
         user_message=user_message,
-        action_json=result.action.model_dump_json(),
-        action_type=result.action.action,
-        dimension_targeted=result.action.dimension_targeted,
-        turn_state="saved",
-        retry_count=result.retries,
+        oriself_text=visible_text,
+        raw_stream=raw_stream,
+        status_sentinel=status,
+        discarded=False,
     )
     db.add(conv)
-    for ev in result.action.evidence:
-        db.add(
-            EvidenceRecord(
-                session_id=session_id,
-                round_number=ev.round_number,
-                dimension=ev.dimension,
-                user_quote=ev.user_quote,
-                confidence=ev.confidence,
-                interpretation=ev.interpretation or "",
-            )
-        )
 
-    if result.action.action == "converge" and result.action.converge_output:
-        co = result.action.converge_output
-        card_json = co.card.model_dump()
-        for pq in card_json.get("pull_quotes", []):
-            pq["text"] = escape_user_quote(pq.get("text", ""))
-
-        slug = None
-        for _ in range(3):
-            candidate = _generate_issue_slug(co.mbti_type)
-            if not db.query(TestResult).filter(
-                TestResult.issue_slug == candidate
-            ).first():
-                slug = candidate
-                break
-        if slug is None:
-            slug = _generate_issue_slug(co.mbti_type)
-
-        safe_html = sanitize_report_html(co.report_html)
-
-        db.add(
-            TestResult(
-                session_id=session_id,
-                mbti_type=co.mbti_type,
-                insight_json=json.dumps(
-                    [p.model_dump() for p in co.insight_paragraphs],
-                    ensure_ascii=False,
-                ),
-                card_json=json.dumps(card_json, ensure_ascii=False),
-                issue_slug=slug,
-                issue_title=co.card.title,
-                issue_html=safe_html,
-                issue_is_public=True,
-                issue_generated_at=datetime.now(timezone.utc),
-            )
-        )
-        sess.status = "completed"
+    # R2 → 解析 preferences
+    if round_number == 2 and not sess.prefs_json:
+        prefs = _parse_preferences_heuristic(user_message)
+        sess.prefs_json = prefs.model_dump_json()
 
     db.commit()
-
-    return TurnResponse(
-        round_number=round_number,
-        action=result.action.model_dump(),
-        used_fallback=result.used_fallback,
-        retries=result.retries,
-        guardrail_reasons=result.guardrail_reasons,
-    )
+    return round_number
 
 
-@router.post("/{letter_id}/turn", response_model=TurnResponse)
-async def take_turn(
-    letter_id: str, req: TurnRequest, db: Session = Depends(get_db)
+# ---------------------------------------------------------------------------
+# POST /letters/{id}/turn  ·  SSE 流
+# ---------------------------------------------------------------------------
+
+
+def _sse(event: str, payload: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _stream_turn_core(
+    db: Session,
+    sess: TestSession,
+    user_message: str,
+    rewrite_hint: Optional[str] = None,
 ):
-    session_id = letter_id  # 内部沿用 session_id 变量名
-    sess = db.get(TestSession, session_id)
-    if sess is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    if sess.status == "completed":
-        raise HTTPException(status_code=400, detail="session already completed")
+    """核心流式 generator · /turn 和 /turn/rewrite 共用。"""
+    state = _load_session_state(db, sess.session_id)
 
-    state = _load_session_state(db, session_id)
+    # Round budget 硬拦截：R30 后直接让前端去 /result
+    if state.round_count >= MAX_ROUNDS:
+        yield _sse("error", {"message": "已到 30 轮硬上限，请前往报告页"})
+        return
 
     bundle = load_skill_bundle()
     backend = make_backend(sess.provider)
-    runner = SkillRunner(backend=backend, bundle=bundle)
-    result = await runner.step(state, req.user_message)
+    runner = TurnRunner(backend=backend, bundle=bundle)
 
-    return _persist_turn(db, sess, req.user_message, result)
+    raw_accum = ""
+    visible = ""
+    status = "CONTINUE"
+    had_error = False
+
+    try:
+        async for kind, payload in runner.stream_turn(
+            state, user_message, rewrite_hint=rewrite_hint
+        ):
+            if kind == "token":
+                raw_accum += payload
+                # 轻量过滤：不主动剥 STATUS 行（它在末尾，用户可能已经看到一两个字符，
+                # 前端也可以做末行剥除）。这里按 gstack 流式规范：先传原文，最后
+                # 在 `done` 事件里给最终 visible_text，前端用 visible_text 覆盖。
+                yield _sse("token", {"delta": payload})
+            elif kind == "error":
+                had_error = True
+                yield _sse("error", {"message": payload})
+                return
+            elif kind == "final":
+                continue
+            elif kind == "status":
+                status = payload
+            elif kind == "visible":
+                visible = payload
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("stream core error")
+        yield _sse("error", {"message": f"stream error: {exc}"})
+        return
+
+    if had_error:
+        return
+
+    # 没收到 visible → 兜底用原文去除 STATUS 行（虽然 runner 的 parser 已经处理过）
+    if not visible:
+        visible = raw_accum.strip()
+
+    try:
+        round_number = _persist_turn(db, sess, user_message, raw_accum, visible, status)
+    except HTTPException as he:
+        yield _sse("error", {"message": he.detail, "status_code": he.status_code})
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("persist error")
+        yield _sse("error", {"message": f"persist error: {exc}"})
+        return
+
+    yield _sse("done", {
+        "round": round_number,
+        "status": status,
+        "visible": visible,
+    })
 
 
-@router.post("/{letter_id}/turn/stream")
-async def take_turn_stream(
+@router.post("/{letter_id}/turn")
+async def take_turn(
     letter_id: str, req: TurnRequest, db: Session = Depends(get_db)
 ):
-    """SSE 版本的 /turn。
-
-    事件（`event: <name>`）：
-    - `phase`：runner 阶段推进（listening → thinking → validating → composed）。
-      data = `{"phase": "...", ...extras}`
-    - `final`：正式 TurnResponse。data 与同步版 /turn 一致。
-    - `error`：失败中断。data = `{"message": "..."}`。
-
-    设计：runner 在后台 task 跑，phase 回调把事件塞进 asyncio.Queue；
-    主 generator 边 drain queue 边 yield。期间定期 emit 注释行作心跳，
-    避免中间代理（Vercel / nginx）buffer 或断线。
-    """
     sess = db.get(TestSession, letter_id)
     if sess is None:
         raise HTTPException(status_code=404, detail="session not found")
     if sess.status == "completed":
         raise HTTPException(status_code=400, detail="session already completed")
 
-    state = _load_session_state(db, letter_id)
-
-    bundle = load_skill_bundle()
-    backend = make_backend(sess.provider)
-    runner = SkillRunner(backend=backend, bundle=bundle)
-
-    queue: asyncio.Queue = asyncio.Queue()
-
-    async def on_phase(phase: str, data: dict) -> None:
-        await queue.put({"event": "phase", "data": {"phase": phase, **data}})
-
-    async def runner_task():
-        try:
-            result = await runner.step(state, req.user_message, on_phase=on_phase)
-            await queue.put({"event": "__result__", "data": result})
-        except Exception as exc:  # noqa: BLE001 — 把异常平移给 generator
-            logger.exception("runner failure in stream")
-            await queue.put({"event": "__error__", "data": {"message": str(exc)}})
-
-    def sse_pack(event: str, payload: dict) -> str:
-        # SSE 规范：event 单行 + data 单行（或多行 data:）+ 空行分隔。
-        return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-    async def event_stream():
-        task = asyncio.create_task(runner_task())
-        try:
-            while True:
-                try:
-                    item = await asyncio.wait_for(queue.get(), timeout=10.0)
-                except asyncio.TimeoutError:
-                    # 心跳 · 注释行 SSE 规范里会被客户端忽略但保持连接
-                    yield ": heartbeat\n\n"
-                    continue
-
-                name = item["event"]
-                if name == "__result__":
-                    result = item["data"]
-                    try:
-                        turn_response = _persist_turn(db, sess, req.user_message, result)
-                    except HTTPException as he:
-                        yield sse_pack("error", {"message": he.detail, "status": he.status_code})
-                        return
-                    except Exception as exc:  # noqa: BLE001
-                        logger.exception("persist failure in stream")
-                        yield sse_pack("error", {"message": f"persist error: {exc}"})
-                        return
-                    yield sse_pack("final", turn_response.model_dump())
-                    return
-                if name == "__error__":
-                    yield sse_pack("error", item["data"])
-                    return
-                yield sse_pack(name, item["data"])
-        finally:
-            if not task.done():
-                task.cancel()
-
     return StreamingResponse(
-        event_stream(),
+        _stream_turn_core(db, sess, req.user_message),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",  # 关掉 nginx/ingress buffer
+            "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /letters/{id}/turn/rewrite  ·  重写最近一轮
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{letter_id}/turn/rewrite")
+async def rewrite_last_turn(
+    letter_id: str, req: RewriteRequest, db: Session = Depends(get_db)
+):
+    """把最近一轮（非 discarded 的最大 round_number）标记为 discarded，
+    然后用相同的 user_message + 一个可选 hint 重新跑一次流。"""
+    sess = db.get(TestSession, letter_id)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    if sess.status == "completed":
+        raise HTTPException(status_code=400, detail="session already completed")
+
+    last = (
+        db.query(Conversation)
+        .filter(
+            Conversation.session_id == letter_id,
+            Conversation.discarded.is_(False),
+        )
+        .order_by(Conversation.round_number.desc(), Conversation.id.desc())
+        .first()
+    )
+    if last is None:
+        raise HTTPException(status_code=400, detail="no turn to rewrite")
+
+    original_user_message = last.user_message
+    last.discarded = True
+    db.commit()
+
+    return StreamingResponse(
+        _stream_turn_core(db, sess, original_user_message, rewrite_hint=req.hint),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /letters/{id}/state
+# ---------------------------------------------------------------------------
 
 
 @router.get("/{letter_id}/state", response_model=StateResponse)
@@ -407,76 +390,50 @@ def get_state(letter_id: str, db: Session = Depends(get_db)):
     if sess is None:
         raise HTTPException(status_code=404, detail="letter not found")
     state = _load_session_state(db, letter_id)
-    counts: dict[str, int] = {"E/I": 0, "S/N": 0, "T/F": 0, "J/P": 0}
-    seen: set[tuple[str, str]] = set()
-    for ev in state.collected_evidence:
-        key = (ev.dimension, ev.user_quote)
-        if key in seen:
-            continue
-        seen.add(key)
-        if ev.dimension in counts:
-            counts[ev.dimension] += 1
+    last_status = None
+    live = state.live_turns()
+    if live:
+        last_status = live[-1].status
+
+    result = db.query(TestResult).filter(TestResult.session_id == letter_id).first()
     return StateResponse(
         letter_id=letter_id,
         round_count=state.round_count,
         status=sess.status,
-        evidence_count_per_dim=counts,
+        last_status=last_status,
+        has_report=result is not None,
+        issue_slug=result.issue_slug if result else None,
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /letters/{id}/transcript
+# ---------------------------------------------------------------------------
 
 
 @router.get("/{letter_id}/transcript", response_model=TranscriptResponse)
 def get_transcript(letter_id: str, db: Session = Depends(get_db)):
-    """回看一封信的完整对话。
-
-    设计：state 端点保持轻量（只回 round 计数 / evidence 维度），不塞历史。
-    历史用单独 endpoint，前端只在"回看对话"场景拉一次。
-    """
     sess = db.get(TestSession, letter_id)
     if sess is None:
         raise HTTPException(status_code=404, detail="letter not found")
 
     convs = (
         db.query(Conversation)
-        .filter(Conversation.session_id == letter_id)
+        .filter(
+            Conversation.session_id == letter_id,
+            Conversation.discarded.is_(False),
+        )
         .order_by(Conversation.round_number.asc())
         .all()
     )
 
     turns: List[TranscriptTurn] = []
     for c in convs:
-        # user 段
         if c.user_message:
-            turns.append(
-                TranscriptTurn(
-                    speaker="you",
-                    text=c.user_message,
-                    round=c.round_number,
-                )
-            )
-        # oriself 段 — 从 action_json 抽可见文本，逻辑与前端 letter-view 兜底一致
-        visible: Optional[str] = None
-        if c.action_json:
-            try:
-                action = json.loads(c.action_json)
-            except Exception:
-                action = {}
-            for k in ("next_prompt", "next_question", "echo", "text"):
-                v = action.get(k)
-                if v and isinstance(v, str) and v.strip():
-                    visible = v.strip()
-                    break
-            if visible is None and action.get("action") == "converge":
-                visible = "信收束了，正在写报告……"
-        if visible:
-            turns.append(
-                TranscriptTurn(
-                    speaker="oriself",
-                    text=visible,
-                    round=c.round_number,
-                )
-            )
+            turns.append(TranscriptTurn(speaker="you", text=c.user_message, round=c.round_number))
+        if c.oriself_text:
+            turns.append(TranscriptTurn(speaker="oriself", text=c.oriself_text, round=c.round_number))
 
-    # 已 converge 时附带 issue_slug，前端可挂个 "看报告" 入口
     issue_slug: Optional[str] = None
     tr = db.query(TestResult).filter(TestResult.session_id == letter_id).first()
     if tr is not None:
@@ -490,15 +447,90 @@ def get_transcript(letter_id: str, db: Session = Depends(get_db)):
     )
 
 
-@router.get("/{letter_id}/result", response_model=ResultResponse)
-def get_result(letter_id: str, db: Session = Depends(get_db)):
-    result = db.query(TestResult).filter(TestResult.session_id == letter_id).first()
-    if result is None:
-        raise HTTPException(status_code=404, detail="result not ready")
+# ---------------------------------------------------------------------------
+# POST /letters/{id}/result  ·  触发报告生成
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{letter_id}/result", response_model=ResultResponse)
+async def compose_result(letter_id: str, db: Session = Depends(get_db)):
+    """触发报告生成。已生成则直接返回；没有则 LLM 跑一次 CONVERGE.md（最多 3 次 retry）。"""
+    sess = db.get(TestSession, letter_id)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="letter not found")
+
+    existing = db.query(TestResult).filter(TestResult.session_id == letter_id).first()
+    if existing is not None:
+        return ResultResponse(
+            letter_id=letter_id,
+            mbti_type=existing.mbti_type,
+            insight_paragraphs=json.loads(existing.insight_json),
+            card=json.loads(existing.card_json),
+            issue_slug=existing.issue_slug,
+        )
+
+    state = _load_session_state(db, letter_id)
+    if state.round_count < 2:
+        raise HTTPException(status_code=400, detail="对话轮数太少，还没法写报告")
+
+    bundle = load_skill_bundle()
+    backend = make_backend(sess.provider)
+    runner = ReportRunner(backend=backend, bundle=bundle)
+
+    result = await runner.compose(state)
+    if result.output is None:
+        sess.status = "failed"
+        db.commit()
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "报告生成失败，请稍后重试",
+                "reasons": result.error_reasons[:3],
+            },
+        )
+
+    co = result.output
+
+    # 生成唯一 slug
+    slug = None
+    for _ in range(3):
+        candidate = _generate_issue_slug(co.mbti_type)
+        if not db.query(TestResult).filter(TestResult.issue_slug == candidate).first():
+            slug = candidate
+            break
+    if slug is None:
+        slug = _generate_issue_slug(co.mbti_type)
+
+    # 清洗 pull_quotes + HTML
+    card_json = co.card.model_dump()
+    for pq in card_json.get("pull_quotes", []):
+        pq["text"] = escape_user_quote(pq.get("text", ""))
+    safe_html = sanitize_report_html(co.report_html)
+
+    insight_list = [p.model_dump() for p in co.insight_paragraphs]
+    confidence = {dim: r.model_dump() for dim, r in co.confidence_per_dim.items()}
+
+    db.add(
+        TestResult(
+            session_id=letter_id,
+            mbti_type=co.mbti_type,
+            insight_json=json.dumps(insight_list, ensure_ascii=False),
+            card_json=json.dumps(card_json, ensure_ascii=False),
+            confidence_json=json.dumps(confidence, ensure_ascii=False),
+            issue_slug=slug,
+            issue_title=co.card.title,
+            issue_html=safe_html,
+            issue_is_public=True,
+            issue_generated_at=datetime.now(timezone.utc),
+        )
+    )
+    sess.status = "completed"
+    db.commit()
+
     return ResultResponse(
         letter_id=letter_id,
-        mbti_type=result.mbti_type,
-        insight_paragraphs=json.loads(result.insight_json),
-        card=json.loads(result.card_json),
-        issue_slug=result.issue_slug,
+        mbti_type=co.mbti_type,
+        insight_paragraphs=insight_list,
+        card=card_json,
+        issue_slug=slug,
     )

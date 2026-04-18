@@ -1,12 +1,16 @@
 """
-多 provider LLM 客户端 · v2.0 精简版。
+多 provider LLM 客户端 · v2.4。
 
-v2.0 只保留两个 provider：
-- `openai_compatible`: 适配 Qwen / DeepSeek / Kimi / 任何 OpenAI 兼容 API。通过 base_url 切换。
-- `mock`: 确定性 mock，单测 / 无密钥演示用。
+v2.4 变化：
+- 每个 backend 暴露两个方法：
+    * `stream_text(messages)` → `AsyncIterator[str]` · 对话轮专用，SSE token 流
+    * `complete_json(messages)` → `dict` · 仅报告生成（converge）用
+- 对话轮不再要 JSON，provider 侧不再传 `response_format`
+- MockBackend 产出带 `STATUS: ...` 末行的纯文本，以及 converge JSON
 
-未来要加 Anthropic / Gemini / Claude 时，在 `backends/` 下加同接口实现即可。
-prompt caching 预留 `cache_breakpoint` 参数供后续接入。
+支持的 provider：
+- `openai_compatible`（Qwen / DeepSeek / Kimi / OpenAI / 302.ai Gemini 等兼容端）
+- `mock` · 确定性 · 无 key / 单测 / 演示
 """
 from __future__ import annotations
 
@@ -16,13 +20,13 @@ import random
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import AsyncIterator, Iterable, List, Optional
+from typing import AsyncIterator, List, Optional
 
 import httpx
 
 
 # ---------------------------------------------------------------------------
-# Message 结构
+# Message
 # ---------------------------------------------------------------------------
 
 
@@ -33,26 +37,8 @@ class Message:
     cache_breakpoint: bool = False  # 预留给未来 Anthropic cache_control
 
 
-# v2.3 · 把 user_message 用 <current_turn>/<history_turn> tag 包了之后，
-# 某些工具（mock、测试）需要拿到去 tag 的原文。这里提供一个小解包函数。
-_TURN_TAG_RE = re.compile(
-    r"^\s*<(current|history)_turn[^>]*>\s*([\s\S]*?)\s*</(current|history)_turn>\s*$"
-)
-
-
-def _unwrap_turn_tag(content: str) -> str:
-    """如果 content 是 <current_turn>...</current_turn> 结构，返回内部文本。
-
-    否则原样返回（兼容历史数据 / 非 tag 格式）。
-    """
-    if not content:
-        return content
-    m = _TURN_TAG_RE.match(content)
-    return m.group(2) if m else content
-
-
 # ---------------------------------------------------------------------------
-# 基础接口
+# Base
 # ---------------------------------------------------------------------------
 
 
@@ -60,13 +46,24 @@ class LLMBackend(ABC):
     provider_name: str = "base"
 
     @abstractmethod
+    async def stream_text(
+        self,
+        messages: List[Message],
+        *,
+        timeout: float = 90.0,
+    ) -> AsyncIterator[str]:
+        """对话轮 · 流式出纯文本。按 token 或 chunk 逐段 yield。"""
+        ...
+
+    @abstractmethod
     async def complete_json(
         self,
         messages: List[Message],
         *,
         response_schema: Optional[dict] = None,
+        timeout: float = 120.0,
     ) -> dict:
-        """一次请求，返回解析后的 JSON dict。失败抛异常。"""
+        """仅报告生成用 · 一次请求返回解析后的 JSON dict。失败抛异常。"""
         ...
 
 
@@ -76,12 +73,7 @@ class LLMBackend(ABC):
 
 
 class OpenAICompatibleBackend(LLMBackend):
-    """通用 OpenAI-compatible API。适配：
-    - Qwen (DashScope): base_url=https://dashscope.aliyuncs.com/compatible-mode/v1
-    - DeepSeek: base_url=https://api.deepseek.com/v1
-    - Kimi (Moonshot): base_url=https://api.moonshot.cn/v1
-    - OpenAI: base_url=https://api.openai.com/v1
-    """
+    """通用 OpenAI-compatible API：Qwen / DeepSeek / Kimi / OpenAI / Gemini-302 等。"""
 
     def __init__(
         self,
@@ -90,26 +82,81 @@ class OpenAICompatibleBackend(LLMBackend):
         base_url: str,
         model: str,
         provider_name: str = "openai_compatible",
-        timeout: float = 60.0,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.provider_name = provider_name
-        self.timeout = timeout
 
+    # ---- 对话轮 · 流式文本 ----
+    async def stream_text(
+        self,
+        messages: List[Message],
+        *,
+        timeout: float = 90.0,
+    ) -> AsyncIterator[str]:
+        payload = {
+            "model": self.model,
+            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "stream": True,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream(
+                "POST",
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+            ) as resp:
+                if resp.status_code >= 400:
+                    body = (await resp.aread()).decode("utf-8", errors="replace")
+                    raise RuntimeError(
+                        f"{self.provider_name} stream {resp.status_code}: {body[:400]}"
+                    )
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    # OpenAI SSE 协议：每行 `data: {...}`，结束行 `data: [DONE]`
+                    if line.startswith(":"):
+                        continue  # 注释 / heartbeat
+                    if line.startswith("data:"):
+                        data = line[5:].strip()
+                    else:
+                        data = line.strip()
+                    if not data or data == "[DONE]":
+                        if data == "[DONE]":
+                            break
+                        continue
+                    try:
+                        obj = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue  # 坏行忽略
+                    choices = obj.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    chunk = delta.get("content")
+                    if chunk:
+                        yield chunk
+
+    # ---- 报告轮 · 非流式 JSON ----
     async def complete_json(
         self,
         messages: List[Message],
         *,
         response_schema: Optional[dict] = None,
+        timeout: float = 120.0,
     ) -> dict:
         payload: dict = {
             "model": self.model,
             "messages": [{"role": m.role, "content": m.content} for m in messages],
             "response_format": {"type": "json_object"},
         }
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 f"{self.base_url}/chat/completions",
                 headers={
@@ -125,15 +172,44 @@ class OpenAICompatibleBackend(LLMBackend):
 
 
 # ---------------------------------------------------------------------------
-# Mock backend（确定性 · 单测 / 无密钥演示）
+# Mock backend
 # ---------------------------------------------------------------------------
 
 
-class MockBackend(LLMBackend):
-    """根据消息历史轮数返回脚本化 Action。
+# mock 对话的预设文本池。按轮数挑，末尾自动拼 STATUS。
+_MOCK_TURN_SCRIPTS = [
+    # R1 握手
+    (
+        "嗨——我不是什么人格测评系统，就是一个想陪你聊 20 分钟上下的朋友。"
+        "聊完不发卷子、不打分，就是希望你聊完能多看自己一点点。\n\n"
+        "开始之前想跟你对一下三件事（你挑愿意说的回就行）：\n"
+        "1. 想聊得轻松点还是深入点？\n"
+        "2. 短的（10-15 轮）、标准（20 轮左右）、还是慢慢聊（25-30 轮）？\n"
+        "3. 最近想聊的或者不想碰的话题？"
+    ),
+    # R2
+    "嗯，那就不赶。最近脑子里在转的事里，有哪一件你挺想跟人说说的？",
+    # R3
+    "你刚说的那个画面——具体是哪一刻开始觉得的？",
+    # R4
+    "周末 6 小时空出来，你的默认剧本是什么？不用想应该的，想真的默认。",
+    # R5
+    "你最近一次觉得'这个人懂我'是跟谁？你们在做什么？",
+    # R6
+    "你的日历 app 现在打开是什么状态？真实的不是理想的。",
+    # R7
+    "你最近一次帮朋友做决定，你是怎么想的？你说了什么？",
+    # R8
+    "你现在闭眼想你现在的工作 / 学业，第一个蹦出来的画面是什么？",
+]
 
-    脚本目标：30 轮内跑完一个完整 MBTI 会话。前几轮 ask，中段混 reflect/probe，
-    尾部 converge。不追真实的 evidence 抽取质量（只追流程可跑通）。
+
+class MockBackend(LLMBackend):
+    """确定性脚本 mock · v2.4 · 文本流 + 收束 JSON。
+
+    - `stream_text`：按轮数从 _MOCK_TURN_SCRIPTS 取一条文本，逐字 yield；
+      末尾补一行 `STATUS: CONTINUE`。到第 8 轮改成 `STATUS: CONVERGE`。
+    - `complete_json`：返回一个占位 converge 结构，便于前后端联调。
     """
 
     provider_name = "mock"
@@ -141,248 +217,160 @@ class MockBackend(LLMBackend):
     def __init__(self, seed: int = 42):
         self.rng = random.Random(seed)
 
+    # ---- 对话轮 ----
+    async def stream_text(
+        self,
+        messages: List[Message],
+        *,
+        timeout: float = 90.0,
+    ) -> AsyncIterator[str]:
+        # 估算当前轮：用 user message 数量（不含 system）
+        user_rounds = [m for m in messages if m.role == "user"]
+        current_round = len(user_rounds)
+        idx = min(current_round - 1, len(_MOCK_TURN_SCRIPTS) - 1)
+        idx = max(idx, 0)
+        body = _MOCK_TURN_SCRIPTS[idx]
+        status = "STATUS: CONVERGE" if current_round >= 8 else "STATUS: CONTINUE"
+        full = body + "\n\n" + status
+        # 逐字 yield，模拟流
+        for ch in full:
+            yield ch
+
+    # ---- 报告轮 ----
     async def complete_json(
         self,
         messages: List[Message],
         *,
         response_schema: Optional[dict] = None,
+        timeout: float = 120.0,
     ) -> dict:
-        # 从 messages 里估算当前是第几轮（user 消息个数）
-        user_rounds = [m for m in messages if m.role == "user"]
-        current_round = len(user_rounds)
-        last_user_message = _unwrap_turn_tag(
-            user_rounds[-1].content if user_rounds else ""
-        )
-        return self._script_action(current_round, last_user_message, messages)
-
-    def _script_action(
-        self, current_round: int, last_user: str, messages: List[Message]
-    ) -> dict:
-        dims = ["E/I", "S/N", "T/F", "J/P"]
-        dim = dims[(current_round - 1) % 4]
-        # evidence 从用户消息里摘前 20 个字作 quote（保证是子串）
-        ev_quote = (last_user[:20] or "占位").strip()
-
-        if current_round <= 2:
-            return {
-                "action": "ask",
-                "dimension_targeted": dim,
-                "evidence": [],
-                "next_prompt": f"（mock · R{current_round}）上周一个完整没出门的一天，过到晚上你感觉怎么样？",
-            }
-
-        if current_round >= 22:
-            return self._build_converge(messages)
-
-        if current_round % 5 == 0 and current_round >= 7:
-            # 偶尔做 reflect
-            return {
-                "action": "reflect",
-                "dimension_targeted": dim,
-                "evidence": [
-                    {
-                        "dimension": dim,
-                        "user_quote": ev_quote,
-                        "round_number": current_round,
-                        "confidence": 0.6,
-                        "interpretation": "mock interpretation",
-                    }
-                ],
-                "next_prompt": f"（mock · reflect · R{current_round}）'{ev_quote[:12]}'... 具体讲一下那个场景？",
-            }
-
-        return {
-            "action": "ask",
-            "dimension_targeted": dim,
-            "evidence": [
-                {
-                    "dimension": dim,
-                    "user_quote": ev_quote,
-                    "round_number": current_round,
-                    "confidence": 0.55,
-                    "interpretation": "mock interpretation",
-                }
-            ],
-            "next_prompt": f"（mock · R{current_round}）再讲一个 {dim} 维度相关的最近具体场景？",
-        }
-
-    def _build_converge(self, messages: List[Message]) -> dict:
-        # 从所有 user 消息拿前 3 条做 pull_quotes & insight 引用
-        # v2.3：user content 现在被 <current_turn>/<history_turn> tag 包裹，
-        # 要 strip 掉 anchor tag 才能拿到真实内容。
-        user_msgs = [_unwrap_turn_tag(m.content) for m in messages if m.role == "user"]
+        user_msgs = [m.content for m in messages if m.role == "user"]
         pulls = []
         rounds_cited = []
         for i, msg in enumerate(user_msgs[:3], start=1):
             pulls.append({"text": (msg[:30] or "占位").strip(), "round": i})
             rounds_cited.append(i)
+        if not rounds_cited:
+            rounds_cited = [1]
+            pulls = [{"text": "占位原话", "round": 1}]
 
         insight = [
             {
                 "theme": "看起来的你",
                 "body": (
-                    f"第 {rounds_cited[0] if rounds_cited else 1} 轮你说 "
-                    f"'{pulls[0]['text'] if pulls else '占位'}' —— 这一条让 mock "
-                    "停了一下。你可能比你以为的要更 I 一些。" * 2
-                )[:400],
-                "quoted_rounds": rounds_cited[:1] or [1],
+                    "这是 mock 生成的第一段洞见占位文本。正式版由 LLM 按 CONVERGE.md 指导生成。"
+                    "至少要 60 字的正文才能通过长度检查，所以这里再多铺一些字数凑一下长度 ok 这样差不多。"
+                ),
+                "quoted_rounds": rounds_cited[:1],
             },
             {
                 "theme": "一个小矛盾",
                 "body": (
-                    f"你在第 {rounds_cited[0] if rounds_cited else 1} 轮和第 "
-                    f"{rounds_cited[-1] if rounds_cited else 2} 轮说的话放一起看，"
-                    "你在别人来找你聊的那种关系里会退后一步看自己。" * 2
-                )[:400],
-                "quoted_rounds": rounds_cited[:2] or [1, 2],
+                    "第二段 mock 占位文本。真实版这里会写 TA 的矛盾或反差。"
+                    "再补点字数达到最低 60 字阈值，保证 JSON schema 通过。"
+                ),
+                "quoted_rounds": rounds_cited[:2],
             },
             {
                 "theme": "一句还没跟自己说的话",
                 "body": (
-                    "你整场没主动说 '我想要什么'，但证据其实都在轮子里。"
-                    f"第 {rounds_cited[-1] if rounds_cited else 3} 轮里那个场景，"
-                    "你自己那一份是存在的。下次它出现的时候，别急着塞回脑子里。"
-                )[:400],
-                "quoted_rounds": rounds_cited[-1:] or [3],
+                    "第三段 mock 占位文本。真实版这里会写 TA 整场对话里隐隐指向但自己没说出的东西。"
+                    "再加几个字把长度撑起来方便通过校验这样就够用了可以了。"
+                ),
+                "quoted_rounds": rounds_cited[-1:],
             },
         ]
 
-        # v2.2 · mock 也得产完整 HTML（stub 版，用于流程测试）
-        para_bodies = "".join(
-            f"<section class=\"section\" style=\"animation-delay:{i*0.12:.2f}s\">"
-            f"<span class=\"num\">0{i+1}</span>"
-            f"<h2>{p['theme']}</h2><p>{p['body']}</p></section>"
-            for i, p in enumerate(insight)
-        )
         quotes_html = "".join(
             f"<blockquote><span>R{q['round']}</span>{q['text']}</blockquote>"
             for q in pulls
         )
+        para_bodies = "".join(
+            f"<section class=\"section\"><span class=\"num\">0{i+1}</span>"
+            f"<h2>{p['theme']}</h2><p>{p['body']}</p></section>"
+            for i, p in enumerate(insight)
+        )
         html = (
             "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-            "<title>一个安静的 INTJ</title><style>"
+            "<title>mock · INTJ</title><style>"
             "body{background:#08080f;color:#c8cdd8;margin:0;"
-            "font-family:-apple-system,'PingFang SC','Noto Sans SC',sans-serif;}"
-            "body::before{content:'';position:fixed;inset:0;z-index:-1;"
-            "background:radial-gradient(ellipse at 15% 80%,rgba(99,102,241,0.1),transparent 50%),"
-            "radial-gradient(ellipse at 80% 20%,rgba(139,92,246,0.07),transparent 50%);}"
-            "main{max-width:860px;margin:auto;padding:clamp(16px,4vw,40px);}"
-            "h1{font-size:clamp(2.2rem,5vw,3.5rem);font-weight:800;"
-            "letter-spacing:-0.03em;font-family:'Noto Serif SC',Georgia,serif;"
-            "color:#e8eaf0;}"
-            ".hero{padding:80px 0;}"
-            ".mbti{font-size:clamp(3rem,8vw,6rem);font-weight:800;color:#818cf8;"
-            "letter-spacing:0.05em;font-family:'SF Mono',ui-monospace,monospace;}"
-            ".section{padding:40px;background:rgba(15,15,25,0.6);"
-            "border:1px solid rgba(255,255,255,0.06);margin:24px 0;border-radius:20px;"
-            "backdrop-filter:blur(20px);"
-            "box-shadow:0 1px 3px rgba(0,0,0,0.25),0 24px 48px -12px rgba(0,0,0,0.5);"
-            "animation:reveal 0.8s cubic-bezier(0.16,1,0.3,1) both;}"
-            "@keyframes reveal{from{opacity:0;transform:translateY(28px);}"
-            "to{opacity:1;transform:translateY(0);}}"
-            ".num{font-size:0.7rem;letter-spacing:0.12em;text-transform:uppercase;"
-            "color:#5a5e72;}"
-            "h2{font-family:'Noto Serif SC',Georgia,serif;color:#e8eaf0;}"
-            "p{line-height:1.8;}"
+            "font-family:'Noto Serif SC',-apple-system,sans-serif;}"
+            "main{max-width:720px;margin:auto;padding:40px;}"
+            "h1{font-size:3rem;font-weight:800;letter-spacing:-0.03em;}"
+            ".mbti{font-size:5rem;font-weight:800;color:#818cf8;"
+            "font-family:'JetBrains Mono',ui-monospace,monospace;}"
+            ".section{padding:32px;background:rgba(15,15,25,0.6);"
+            "border:1px solid rgba(255,255,255,0.06);margin:20px 0;border-radius:16px;}"
+            ".num{font-size:0.7rem;letter-spacing:0.12em;color:#5a5e72;}"
             "blockquote{background:rgba(129,140,248,0.06);border-left:2px solid #818cf8;"
-            "padding:16px 20px;margin:12px 0;border-radius:8px;}"
-            "blockquote span{display:inline-block;font-size:0.7rem;"
-            "color:#c084fc;margin-right:12px;letter-spacing:0.1em;}"
+            "padding:12px 16px;margin:10px 0;border-radius:8px;}"
+            "blockquote span{display:inline-block;color:#c084fc;margin-right:12px;}"
             "</style></head><body><main>"
-            f"<section class=\"hero\"><div class=\"mbti\">INTJ</div>"
+            "<section><div class=\"mbti\">INTJ</div>"
             "<h1>一个安静的 INTJ</h1>"
             "<p style=\"color:#c084fc;\">mock · 演示用名片</p></section>"
             + para_bodies
-            + "<section class=\"section\"><span class=\"num\">— 你的原话</span>"
+            + "<section class=\"section\"><span class=\"num\">你的原话</span>"
             + quotes_html
-            + "</section>"
-            "<section class=\"section\"><p>mock 版本仅用于流程校验。"
-            "真实版由 LLM 按 phase5-converge.md 指导生成。</p></section>"
-            "</main></body></html>"
+            + "</section></main></body></html>"
         )
+
         return {
-            "action": "converge",
-            "dimension_targeted": "none",
-            "evidence": [],
-            "next_prompt": "差不多了。接下来我给你一段话，看完可以骂也可以挑刺。",
-            "converge_output": {
-                "mbti_type": "INTJ",
-                "confidence_per_dim": {
-                    "E/I": 0.7,
-                    "S/N": 0.65,
-                    "T/F": 0.6,
-                    "J/P": 0.6,
-                },
-                "insight_paragraphs": insight,
-                "card": {
-                    "title": "一个安静的 INTJ",
-                    "mbti_type": "INTJ",
-                    "subtitle": "mock · 演示用名片",
-                    "pull_quotes": pulls,
-                    "typography_hint": "editorial_serif",
-                },
-                "report_html": html,
+            "mbti_type": "INTJ",
+            "confidence_per_dim": {
+                "E/I": {"letter": "I", "score": 0.72},
+                "S/N": {"letter": "N", "score": 0.65},
+                "T/F": {"letter": "T", "score": 0.60},
+                "J/P": {"letter": "J", "score": 0.58},
             },
+            "insight_paragraphs": insight,
+            "card": {
+                "title": "一个安静的 INTJ",
+                "mbti_type": "INTJ",
+                "subtitle": "mock · 演示用名片",
+                "pull_quotes": pulls,
+                "typography_hint": "editorial_serif",
+            },
+            "report_html": html,
         }
 
 
 # ---------------------------------------------------------------------------
-# JSON 解析 · 容错：LLM 偶尔会在 JSON 外包一层 markdown
+# JSON 容错解析（仅 complete_json 用）
 # ---------------------------------------------------------------------------
 
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
-
-# report_html 字段的开头定位
-_HTML_FIELD_START = re.compile(
-    r'"report_html"\s*:\s*"', re.DOTALL
-)
+_HTML_FIELD_START = re.compile(r'"report_html"\s*:\s*"', re.DOTALL)
 
 
 def _repair_html_json_field(raw: str) -> str:
-    """尝试修复 report_html 字段里未转义的字符。
-
-    LLM 经常在长 HTML 字符串里漏转义引号和换行。策略：
-    1. 找到 "report_html": " 的起始位置
-    2. 向后扫描找到字符串的真正结尾（考虑 JSON 后续结构 }", } 等）
-    3. 把中间的 HTML 内容做 JSON 安全转义
-    4. 重新拼接
-    """
+    """修复 report_html 字段里未转义的字符（LLM 常漏）。"""
     m = _HTML_FIELD_START.search(raw)
     if not m:
         return raw
-
-    prefix = raw[:m.end()]  # 从头到 "report_html": " 的引号之后
-    rest = raw[m.end():]  # HTML 内容开始
-
-    # 找 HTML 字符串的结尾：从尾部反向找 </html> 后第一个引号
+    prefix = raw[: m.end()]
+    rest = raw[m.end():]
     html_end_marker = rest.rfind("</html>")
     if html_end_marker == -1:
         html_end_marker = rest.rfind("</HTML>")
     if html_end_marker == -1:
-        return raw  # 找不到 </html>，放弃修复
-
-    # </html> 之后向后找到第一个不在 HTML 里的引号（闭合 JSON 字符串）
+        return raw
     scan_from = html_end_marker + len("</html>")
     close_quote_pos = rest.find('"', scan_from)
     if close_quote_pos == -1:
-        # 可能 </html> 就是结尾，引号在紧接着
         close_quote_pos = scan_from
-
     html_raw = rest[:close_quote_pos]
-    suffix = rest[close_quote_pos:]  # 从闭合引号到末尾（"}\n} 这类）
-
-    # 转义 HTML 内容使之成为合法 JSON 字符串
+    suffix = rest[close_quote_pos:]
     html_escaped = (
         html_raw
-        .replace("\\", "\\\\")   # 先转义反斜杠
-        .replace('"', '\\"')     # 转义引号
-        .replace("\n", "\\n")    # 转义换行
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
         .replace("\r", "\\r")
         .replace("\t", "\\t")
     )
-
     return prefix + html_escaped + suffix
 
 
@@ -390,30 +378,22 @@ def _parse_json_safe(content: str) -> dict:
     content = content.strip()
     if not content:
         raise ValueError("empty LLM content")
-    # 剥 markdown fence
     m = _JSON_FENCE_RE.search(content)
     if m:
         content = m.group(1)
-
-    # 第 1 次尝试：标准解析
     try:
         return json.loads(content)
     except json.JSONDecodeError:
         pass
-
-    # 第 2 次尝试：strict=False（容忍控制字符）
     try:
         return json.loads(content, strict=False)
     except json.JSONDecodeError:
         pass
-
-    # 第 3 次尝试：修复 report_html 字段的转义问题
     try:
         repaired = _repair_html_json_field(content)
         return json.loads(repaired, strict=False)
     except (json.JSONDecodeError, Exception):
         pass
-
     raise ValueError(f"LLM did not return valid JSON: {content[:200]!r}")
 
 
@@ -460,7 +440,6 @@ def make_backend(provider: str) -> LLMBackend:
     if provider == "mock":
         seed = int(os.environ.get("ORISELF_MOCK_SEED", "42"))
         return MockBackend(seed=seed)
-
     preset = PROVIDER_PRESETS.get(provider)
     if preset is None:
         raise ValueError(f"unknown provider: {provider}")

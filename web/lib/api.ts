@@ -1,12 +1,9 @@
 /**
- * Thin API client.
+ * Thin API client · v2.4。
  *
- * In the browser, requests go through Next's /api/* rewrite (set in
- * next.config.mjs), which proxies to the backend via API_INTERNAL_URL.
- * This keeps the backend URL out of the client bundle.
- *
- * In Server Components, we also use /api/* — fetch() on the server resolves
- * the rewrite correctly in Next 15.
+ * 对话轮走 SSE token 流。报告生成走独立 POST。
+ * In the browser, requests go through Next's /api/* rewrite.
+ * In Server Components, we also use /api/* — fetch() 在 Next 15 里能自动解析 rewrite。
  */
 
 import type {
@@ -17,11 +14,11 @@ import type {
   LetterResult,
   LetterState,
   LetterTranscript,
-  TurnResponse,
+  TurnDonePayload,
+  TurnStatus,
 } from "./types";
 
 function baseUrl(): string {
-  // Server-side: use internal Docker URL. Client-side: relative /api path.
   if (typeof window === "undefined") {
     return process.env.API_INTERNAL_URL || "http://localhost:8000";
   }
@@ -61,77 +58,63 @@ export async function getLetterState(letterId: string): Promise<LetterState> {
   return jsonFetch(`/letters/${letterId}/state`);
 }
 
-/** 拉取一封信的完整对话历史 — 回看场景用。 */
 export async function getLetterTranscript(
   letterId: string,
 ): Promise<LetterTranscript> {
   return jsonFetch(`/letters/${letterId}/transcript`);
 }
 
-export async function sendTurn(
-  letterId: string,
-  userMessage: string,
-): Promise<TurnResponse> {
-  return jsonFetch(`/letters/${letterId}/turn`, {
-    method: "POST",
-    body: JSON.stringify({ user_message: userMessage }),
-  });
-}
-
-/**
- * 后端推给前端的阶段事件。对应 `server/routes/letters.py` 的 `on_phase`。
- *
- * - listening：在理解用户这一轮输入、装配上下文
- * - thinking：LLM 正在生成（耗时最大的一段）
- * - validating：JSON 返回了，guardrails 校验中
- * - retrying：一次尝试失败，准备重试
- * - composed：成功，action 已经捏好
- * - fallback：最终走降级
- */
-export type TurnStreamPhase =
-  | "listening"
-  | "thinking"
-  | "validating"
-  | "retrying"
-  | "composed"
-  | "fallback";
-
-export interface TurnStreamPhaseEvent {
-  phase: TurnStreamPhase;
-  attempt?: number;
-  reason?: string;
-  round?: number;
-  phase_key?: string;
-  is_converge?: boolean;
-  action_type?: string;
-  dimension_targeted?: string | null;
-  evidence_count?: number;
-  reasons?: string[];
-}
-
 export interface TurnStreamOptions {
-  onPhase?: (evt: TurnStreamPhaseEvent) => void;
+  onToken?: (delta: string) => void;
+  onError?: (message: string) => void;
   signal?: AbortSignal;
 }
 
 /**
- * 流式版 sendTurn — SSE 协议。
+ * 流式对话 · SSE token 透传 + 结束时给 DonePayload。
  *
- * 订阅阶段事件，最终 resolve 成完整 TurnResponse（与 /turn 接口一致）。
- * 若后端推 `event: error`，抛出。
+ * 事件：
+ *  - event: token   { delta: string }
+ *  - event: done    { round, status, visible }
+ *  - event: error   { message }
  */
 export async function sendTurnStream(
   letterId: string,
   userMessage: string,
   opts: TurnStreamOptions = {},
-): Promise<TurnResponse> {
-  const res = await fetch(`${baseUrl()}/letters/${letterId}/turn/stream`, {
+): Promise<TurnDonePayload> {
+  return streamToDone(
+    `${baseUrl()}/letters/${letterId}/turn`,
+    JSON.stringify({ user_message: userMessage }),
+    opts,
+  );
+}
+
+/** 重写最近一轮 · 同样走 SSE。 */
+export async function rewriteLastTurn(
+  letterId: string,
+  opts: TurnStreamOptions & { hint?: string } = {},
+): Promise<TurnDonePayload> {
+  const { hint, ...rest } = opts;
+  return streamToDone(
+    `${baseUrl()}/letters/${letterId}/turn/rewrite`,
+    JSON.stringify({ hint: hint ?? null }),
+    rest,
+  );
+}
+
+async function streamToDone(
+  url: string,
+  body: string,
+  opts: TurnStreamOptions,
+): Promise<TurnDonePayload> {
+  const res = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Accept: "text/event-stream",
     },
-    body: JSON.stringify({ user_message: userMessage }),
+    body,
     cache: "no-store",
     signal: opts.signal,
   });
@@ -146,10 +129,9 @@ export async function sendTurnStream(
   const reader = res.body.getReader();
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
-  let final: TurnResponse | null = null;
+  let done: TurnDonePayload | null = null;
   let errorMsg: string | null = null;
 
-  // SSE 分帧：\n\n 作帧分隔符。帧内逐行解析 event: / data:（忽略 : 开头的注释行）。
   const handleFrame = (frame: string) => {
     const lines = frame.split(/\r?\n/);
     let evtName = "message";
@@ -167,24 +149,24 @@ export async function sendTurnStream(
     try {
       payload = JSON.parse(dataLines.join("\n"));
     } catch {
-      return; // 损坏帧忽略
+      return;
     }
-
-    if (evtName === "phase") {
-      opts.onPhase?.(payload as TurnStreamPhaseEvent);
-    } else if (evtName === "final") {
-      final = payload as TurnResponse;
+    if (evtName === "token") {
+      const delta = (payload as { delta?: string })?.delta ?? "";
+      if (delta) opts.onToken?.(delta);
+    } else if (evtName === "done") {
+      done = payload as TurnDonePayload;
     } else if (evtName === "error") {
       const p = payload as { message?: string };
       errorMsg = p?.message ?? "stream error";
+      opts.onError?.(errorMsg);
     }
   };
 
   while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+    const { done: streamDone, value } = await reader.read();
+    if (streamDone) break;
     buffer += decoder.decode(value, { stream: true });
-    // 按 \n\n 切帧；保留未完成的尾巴在 buffer 里
     let idx: number;
     while ((idx = buffer.indexOf("\n\n")) !== -1) {
       const frame = buffer.slice(0, idx);
@@ -192,17 +174,20 @@ export async function sendTurnStream(
       if (frame.trim()) handleFrame(frame);
     }
   }
-  // flush 结尾
   if (buffer.trim()) handleFrame(buffer);
 
   if (errorMsg) throw new Error(errorMsg);
-  if (!final) throw new Error("stream ended without final event");
-  return final;
+  if (!done) throw new Error("stream ended without done event");
+  return done;
 }
 
-export async function getResult(letterId: string): Promise<LetterResult> {
-  return jsonFetch(`/letters/${letterId}/result`);
+/** 触发报告生成 · converge 后调用。已生成则返回现成结果；没生成则跑 compose。 */
+export async function composeResult(letterId: string): Promise<LetterResult> {
+  return jsonFetch(`/letters/${letterId}/result`, { method: "POST" });
 }
+
+// 兼容别名（旧 import 名）
+export const getResult = composeResult;
 
 // ───── Issues ─────
 

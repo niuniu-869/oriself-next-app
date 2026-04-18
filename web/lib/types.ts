@@ -1,9 +1,7 @@
 /**
- * Shared types between server (FastAPI) and web (Next.js).
+ * 前后端共享类型 · v2.4。
  *
- * These should eventually be generated from the FastAPI OpenAPI schema via
- * openapi-typescript. For now, hand-written — keep in sync with
- * server/oriself_server/schemas.py and routes/*.py.
+ * 对话轮不再是 JSON；只有报告生成的一步保留 schema。
  */
 
 export interface LetterCreateResponse {
@@ -13,47 +11,16 @@ export interface LetterCreateResponse {
   skill_version: string;
 }
 
-export interface Evidence {
-  dimension: string;
-  user_quote: string;
-  round_number: number;
-  confidence: number;
-  interpretation?: string;
+/** 每轮 SSE done 事件的 payload。 */
+export type TurnStatus = "CONTINUE" | "CONVERGE" | "NEED_USER";
+
+export interface TurnDonePayload {
+  round: number;
+  status: TurnStatus;
+  visible: string;
 }
 
-export type LetterActionType =
-  | "onboarding"
-  | "warm_echo"
-  | "ask"
-  | "reflect"
-  | "scenario_quiz"
-  | "probe_contradiction"
-  | "redirect"
-  | "midpoint_reflect"
-  | "soft_closing"
-  | "converge";
-
-export interface LetterAction {
-  action: LetterActionType;
-  dimension_targeted?: string;
-  /** v2.3 · 唯一可见文本字段。runner 会保证非空（converge 除外）。 */
-  next_prompt?: string;
-  evidence?: Evidence[];
-  // 兼容字段（旧 mock / 兜底）
-  next_question?: string;
-  echo?: string;
-  text?: string;
-}
-
-export interface TurnResponse {
-  round_number: number;
-  action: LetterAction;
-  used_fallback: boolean;
-  retries: number;
-  guardrail_reasons: string[];
-}
-
-/** Client-side turn record (normalized for rendering). */
+/** 对话轮记录 · 前端渲染用（服务端 transcript 已剥除 STATUS）。 */
 export interface TurnRecord {
   speaker: "oriself" | "you";
   text: string;
@@ -64,11 +31,12 @@ export interface LetterState {
   letter_id: string;
   round_count: number;
   status: "active" | "completed" | "failed";
-  evidence_count_per_dim: Record<string, number>;
-  turns?: TurnRecord[]; // populated by the wrapper from /letters/:id (future)
+  last_status?: TurnStatus;
+  has_report: boolean;
+  issue_slug?: string | null;
 }
 
-/** /letters/{id}/transcript 的响应 — 历史回看用。 */
+/** /letters/{id}/transcript */
 export interface LetterTranscript {
   letter_id: string;
   status: "active" | "completed" | "failed";
@@ -76,10 +44,11 @@ export interface LetterTranscript {
   issue_slug: string | null;
 }
 
+/** /letters/{id}/result */
 export interface LetterResult {
   letter_id: string;
   mbti_type: string;
-  insight_paragraphs: Array<{ title: string; text: string }>;
+  insight_paragraphs: Array<{ theme: string; body: string; quoted_rounds: number[] }>;
   card: Record<string, unknown>;
   issue_slug: string | null;
 }

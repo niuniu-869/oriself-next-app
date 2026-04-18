@@ -6,105 +6,195 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Masthead } from "@/components/masthead";
 import { Composer } from "@/components/letter/composer";
 import { Turn } from "@/components/letter/turn";
-import { ThinkingTrail } from "@/components/letter/thinking-trail";
-import { sendTurnStream, getResult } from "@/lib/api";
-import type { TurnStreamPhaseEvent } from "@/lib/api";
-import type { LetterState, TurnRecord } from "@/lib/types";
+import {
+  composeResult,
+  rewriteLastTurn,
+  sendTurnStream,
+} from "@/lib/api";
+import type { LetterState, TurnRecord, TurnStatus } from "@/lib/types";
 
 interface Props {
   letterId: string;
   initialState: LetterState;
   /** 已 converge 的 letter — 渲染"看报告"入口替换 composer。 */
   issueSlug?: string | null;
+  /** 回看时注入的完整历史轮。 */
+  initialTurns: TurnRecord[];
 }
 
 /**
- * Letter view — the conversation interface.
+ * Letter view · v2.4 的对话界面。
  *
- * Invariants:
- *  - No bubbles, no avatars, no timestamps.
- *  - OriSelf's new lines reveal line-by-line (handled by Turn component).
- *  - Composer is a line, not a box.
- *  - On converge, redirect to /issues/:slug.
+ * 不变式：
+ *  - 无气泡、无头像、无时间戳。
+ *  - OriSelf 的新回复按 token 流逐字出现。
+ *  - Composer 是一条线，不是一个框。
+ *  - 最近一个 oriself 轮下方显示「让 TA 重写」按钮。
+ *  - LLM 在流末尾声明 STATUS: CONVERGE → 服务端剥除；前端收到 done.status=CONVERGE
+ *    自动触发报告生成并跳 /issues/:slug。
  */
-export function LetterView({ letterId, initialState, issueSlug }: Props) {
+export function LetterView({ letterId, initialState, issueSlug, initialTurns }: Props) {
   const router = useRouter();
   const isCompleted = initialState.status === "completed";
-  const [turns, setTurns] = useState<TurnRecord[]>(initialState.turns ?? []);
-  const [isThinking, setIsThinking] = useState(false);
-  const [phaseTrail, setPhaseTrail] = useState<TurnStreamPhaseEvent[]>([]);
+
+  const [turns, setTurns] = useState<TurnRecord[]>(initialTurns);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [lastStatus, setLastStatus] = useState<TurnStatus | null>(
+    initialState.last_status ?? null,
+  );
   const [error, setError] = useState<string | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll to the freshest turn
+  // 自动滚到最新
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [turns.length, isThinking, phaseTrail.length]);
+  }, [turns, isStreaming]);
+
+  // ============================================================
+  // 流式辅助
+  // ============================================================
+
+  const openOriselfStreamingTurn = useCallback((round: number) => {
+    setTurns((prev) => [...prev, { speaker: "oriself", text: "", round }]);
+  }, []);
+
+  const appendOriselfToken = useCallback((delta: string) => {
+    setTurns((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      if (last.speaker !== "oriself") return prev;
+      const updated = { ...last, text: last.text + delta };
+      return [...prev.slice(0, -1), updated];
+    });
+  }, []);
+
+  const finalizeOriselfTurn = useCallback((visible: string, round: number) => {
+    setTurns((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      if (last.speaker !== "oriself") return prev;
+      return [...prev.slice(0, -1), { speaker: "oriself", text: visible, round }];
+    });
+  }, []);
+
+  const handleConverge = useCallback(async () => {
+    try {
+      const result = await composeResult(letterId);
+      if (result.issue_slug) {
+        router.push(`/issues/${result.issue_slug}`);
+      } else {
+        setError("报告生成成功但没有 issue slug，请刷新页面");
+      }
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "报告生成卡住了，稍后再试",
+      );
+    }
+  }, [letterId, router]);
+
+  // ============================================================
+  // 发送一轮
+  // ============================================================
 
   const handleSend = useCallback(
     async (text: string) => {
-      if (!text.trim() || isThinking) return;
+      if (!text.trim() || isStreaming) return;
 
-      // Optimistic user turn
-      const userTurn: TurnRecord = {
-        speaker: "you",
-        text: text.trim(),
-        round: turns.length + 1,
-      };
-      setTurns((prev) => [...prev, userTurn]);
-      setIsThinking(true);
-      setPhaseTrail([]);
+      const nextRound =
+        (turns.filter((t) => t.speaker === "you").slice(-1)[0]?.round ?? 0) + 1;
+      setTurns((prev) => [
+        ...prev,
+        { speaker: "you", text: text.trim(), round: nextRound },
+      ]);
+
+      setIsStreaming(true);
       setError(null);
+      openOriselfStreamingTurn(nextRound);
 
       try {
-        const res = await sendTurnStream(letterId, text.trim(), {
-          onPhase: (evt) => {
-            // 同一 phase 的连续事件压扁成一条，避免 "thinking" 被 retry 打成 N 条
-            setPhaseTrail((prev) => {
-              if (prev.length && prev[prev.length - 1].phase === evt.phase) {
-                return [...prev.slice(0, -1), evt];
-              }
-              return [...prev, evt];
-            });
-          },
+        const done = await sendTurnStream(letterId, text.trim(), {
+          onToken: appendOriselfToken,
         });
-        const { action } = res;
-
-        // v2.3：可见文本统一在 next_prompt。converge 不带可见话术（直接跳报告）。
-        // 兼容字段保留作 mock/旧 provider 的兜底。
-        const visible =
-          action.next_prompt?.trim() ||
-          action.next_question?.trim() ||
-          action.echo?.trim() ||
-          action.text?.trim() ||
-          (action.action === "converge" ? "信收束了，正在写报告……" : "……");
-
-        const oriselfTurn: TurnRecord = {
-          speaker: "oriself",
-          text: visible,
-          round: res.round_number,
-        };
-
-        setTurns((prev) => [...prev, oriselfTurn]);
-
-        // Converge → redirect to issue page
-        if (action.action === "converge") {
-          const result = await getResult(letterId);
-          if (result.issue_slug) {
-            router.push(`/issues/${result.issue_slug}`);
-          }
+        finalizeOriselfTurn(done.visible, done.round);
+        setLastStatus(done.status);
+        if (done.status === "CONVERGE") {
+          await handleConverge();
         }
       } catch (err) {
         setError(err instanceof Error ? err.message : "发送失败，稍后再试");
       } finally {
-        setIsThinking(false);
-        setPhaseTrail([]);
+        setIsStreaming(false);
       }
     },
-    [letterId, turns.length, isThinking, router],
+    [
+      letterId,
+      turns,
+      isStreaming,
+      openOriselfStreamingTurn,
+      appendOriselfToken,
+      finalizeOriselfTurn,
+      handleConverge,
+    ],
   );
 
-  const currentRound = turns.length;
+  // ============================================================
+  // 重写最近一轮
+  // ============================================================
+
+  const handleRewrite = useCallback(async () => {
+    if (isStreaming) return;
+    const lastOri = [...turns].reverse().find((t) => t.speaker === "oriself");
+    if (!lastOri) return;
+
+    setTurns((prev) => {
+      for (let i = prev.length - 1; i >= 0; i--) {
+        if (prev[i].speaker === "oriself") {
+          return prev.slice(0, i);
+        }
+      }
+      return prev;
+    });
+
+    setIsStreaming(true);
+    setError(null);
+    openOriselfStreamingTurn(lastOri.round);
+
+    try {
+      const done = await rewriteLastTurn(letterId, {
+        onToken: appendOriselfToken,
+      });
+      finalizeOriselfTurn(done.visible, done.round);
+      setLastStatus(done.status);
+      if (done.status === "CONVERGE") {
+        await handleConverge();
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "重写失败，稍后再试");
+    } finally {
+      setIsStreaming(false);
+    }
+  }, [
+    letterId,
+    isStreaming,
+    turns,
+    openOriselfStreamingTurn,
+    appendOriselfToken,
+    finalizeOriselfTurn,
+    handleConverge,
+  ]);
+
+  // ============================================================
+  // Render
+  // ============================================================
+
+  const currentRound = Math.max(...turns.map((t) => t.round), 0);
+
+  const lastOriselfIdx = (() => {
+    for (let i = turns.length - 1; i >= 0; i--) {
+      if (turns[i].speaker === "oriself") return i;
+    }
+    return -1;
+  })();
 
   return (
     <>
@@ -123,7 +213,6 @@ export function LetterView({ letterId, initialState, issueSlug }: Props) {
       <main className="relative z-10 max-w-[620px] mx-auto px-8 pt-[140px] pb-[260px]">
         {turns.length === 0 && (
           <div className="mb-14">
-            {/* Just the round number. No headline, no copy. */}
             <span
               className="text-accent"
               style={{
@@ -141,16 +230,34 @@ export function LetterView({ letterId, initialState, issueSlug }: Props) {
           </div>
         )}
 
-        {turns.map((turn, i) => (
-          <Turn
-            key={`${turn.round}-${turn.speaker}-${i}`}
-            turn={turn}
-            // Last OriSelf turn reveals line-by-line; older turns settle in instantly
-            reveal={turn.speaker === "oriself" && i === turns.length - 1}
-          />
-        ))}
+        {turns.map((turn, i) => {
+          const isLastOriself = i === lastOriselfIdx;
+          const showStreaming = isLastOriself && isStreaming;
+          return (
+            <div key={`${turn.round}-${turn.speaker}-${i}`}>
+              <Turn turn={turn} streaming={showStreaming} />
+              {isLastOriself && !isStreaming && !isCompleted && (
+                <div className="-mt-10 mb-14 pl-0">
+                  <button
+                    type="button"
+                    onClick={handleRewrite}
+                    className="font-mono text-[10px] tracking-widest uppercase text-ink-muted hover:text-accent transition-colors duration-300 bg-transparent border-0 cursor-pointer p-0"
+                    disabled={isStreaming}
+                    aria-label="让 OriSelf 重写这一轮"
+                  >
+                    让 TA 重写 <span className="not-italic">↻</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
 
-        {isThinking && <ThinkingTrail trail={phaseTrail} />}
+        {lastStatus === "NEED_USER" && !isStreaming && (
+          <p className="font-mono text-[11px] tracking-wide uppercase text-accent mt-4">
+            TA 好像在等你多说一点 —— 聊到哪都行。
+          </p>
+        )}
 
         {error && (
           <p className="font-mono text-[11px] tracking-wide uppercase text-accent mt-10">
@@ -166,7 +273,7 @@ export function LetterView({ letterId, initialState, issueSlug }: Props) {
       ) : (
         <Composer
           onSend={handleSend}
-          disabled={isThinking}
+          disabled={isStreaming}
           draftKey={letterId}
         />
       )}
@@ -174,10 +281,6 @@ export function LetterView({ letterId, initialState, issueSlug }: Props) {
   );
 }
 
-/**
- * 已收尾的信不再接受输入，给一条克制的回看提示 + 直达报告的入口。
- * 保持和 Composer 一致的底部 fixed 结构，避免视觉跳变。
- */
 function CompletedFooter({ issueSlug }: { issueSlug: string | null }) {
   return (
     <footer

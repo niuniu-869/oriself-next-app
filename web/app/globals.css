@@ -94,6 +94,34 @@ body::after {
   height: 0;
 }
 
+/* ═══ Custom cursor · hide native, show oxblood dot ═══
+   桌面端（有 hover + 细腻指针）隐藏系统光标，由 <CustomCursor /> 组件接管。
+   触屏设备（hover: none）保持原生交互，CustomCursor 组件自身会跳过挂载。
+   文本 caret（光标闪烁条）由 caret-color 单独控制，不受 cursor: none 影响。 */
+@media (hover: hover) and (pointer: fine) {
+  html,
+  body,
+  a,
+  button,
+  textarea,
+  input,
+  select,
+  label,
+  [role="button"],
+  [data-interactive] {
+    cursor: none;
+  }
+}
+
+/* 交互元素上方放大成环 */
+.cursor-dot.expanded {
+  width: 28px;
+  height: 28px;
+  background: transparent;
+  border: 1px solid var(--accent);
+  mix-blend-mode: normal;
+}
+
 /* ═══ Writing cursor (for inline typewriter) ═══ */
 .writing-cursor {
   display: inline-block;

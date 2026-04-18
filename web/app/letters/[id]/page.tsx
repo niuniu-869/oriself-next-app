@@ -3,13 +3,12 @@ import { getLetterState, getLetterTranscript } from "@/lib/api";
 import { LetterView } from "./letter-view";
 
 /**
- * /letters/:id · the conversation itself.
+ * /letters/:id · 对话本体。
  *
- * Server component 同时拉 state（轻量元数据）和 transcript（历史 turns），
+ * v2.4 · Server component 拉 state（元数据）+ transcript（历史轮），
  * 让"回看一封信"也能立刻看到完整对话。
  *
- * 失败容忍：transcript 拿不到时降级为空数组，仍能进 view（active 信件
- * 也能继续聊）。
+ * 失败容忍：transcript 拿不到时降级为空数组，仍能进 view。
  */
 export const dynamic = "force-dynamic";
 
@@ -27,20 +26,21 @@ export default async function LetterPage({
     notFound();
   }
 
-  let initialTurns = state.turns ?? [];
+  let initialTurns: import("@/lib/types").TurnRecord[] = [];
   let issueSlug: string | null = null;
   try {
     const transcript = await getLetterTranscript(id);
     initialTurns = transcript.turns;
     issueSlug = transcript.issue_slug;
   } catch {
-    // transcript 失败不阻断 — view 仍能跑
+    // transcript 失败不阻断
   }
 
   return (
     <LetterView
       letterId={id}
-      initialState={{ ...state, turns: initialTurns }}
+      initialState={state}
+      initialTurns={initialTurns}
       issueSlug={issueSlug}
     />
   );

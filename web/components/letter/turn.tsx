@@ -5,29 +5,36 @@ import type { TurnRecord } from '@/lib/types';
 
 interface Props {
   turn: TurnRecord;
-  /** If true, reveal line-by-line (for the freshest OriSelf response). */
-  reveal?: boolean;
+  /** 流式中：文本正在增长，在结尾渲染一个跳动游标。 */
+  streaming?: boolean;
 }
 
 /**
- * A single turn in the letter.
+ * 单条 turn。
  *
- * OriSelf speaks first-class: serif body, no bubble.
- * You speaks indented with an em-dash drop cap.
- * No avatars, no timestamps, no "…said:" — the typography IS the distinction.
+ * OriSelf · serif body，无气泡。
+ * You · 左侧 em-dash 点缀。
+ * 无头像、无时间戳。
+ *
+ * v2.4 · 删除旧的 RevealText 分句动画 —— 真流式时文本每帧都在变，按标点分段的
+ * 动画会反复重排很丑。现在只做两件事：`white-space: pre-wrap` 保留换行 +
+ * streaming 时末尾挂一个 writing-cursor。
  */
-export const Turn = memo(function Turn({ turn, reveal = false }: Props) {
+export const Turn = memo(function Turn({ turn, streaming = false }: Props) {
   if (turn.speaker === 'oriself') {
     return (
       <article className="mb-14 animate-settle">
-        <p className="fraunces-body text-[20px] leading-[1.62] tracking-tight text-ink">
-          {reveal ? <RevealText text={turn.text} /> : turn.text}
+        <p
+          className="fraunces-body text-[20px] leading-[1.62] tracking-tight text-ink"
+          style={{ whiteSpace: 'pre-wrap' }}
+        >
+          {turn.text}
+          {streaming && <span className="writing-cursor inline-block align-baseline" />}
         </p>
       </article>
     );
   }
 
-  // You
   return (
     <article className="mb-14 pl-9 relative animate-settle">
       <span
@@ -37,42 +44,12 @@ export const Turn = memo(function Turn({ turn, reveal = false }: Props) {
       >
         —
       </span>
-      <p className="fraunces-body-soft text-[19px] leading-[1.65] text-ink-soft">
+      <p
+        className="fraunces-body-soft text-[19px] leading-[1.65] text-ink-soft"
+        style={{ whiteSpace: 'pre-wrap' }}
+      >
         {turn.text}
       </p>
     </article>
   );
 });
-
-/**
- * RevealText · splits into lines and stagger-reveals each.
- *
- * Pure CSS approach: wrap each chunk in a span with increasing animation-delay.
- * Splits on Chinese sentence endings (。？！……——) and commas for natural
- * breath pauses.
- */
-function RevealText({ text }: { text: string }) {
-  // Split into clauses at punctuation + keep the punctuation with the clause
-  const segments = text.split(/(?<=[。？！；……——])/).filter(Boolean);
-
-  return (
-    <>
-      {segments.map((seg, i) => (
-        <span
-          key={i}
-          className="inline-block opacity-0 animate-rise"
-          style={{
-            animationDelay: `${i * 0.35}s`,
-            animationFillMode: 'forwards',
-          }}
-        >
-          {seg}
-        </span>
-      ))}
-      <span
-        className="writing-cursor"
-        style={{ animationDelay: `${segments.length * 0.35}s` }}
-      />
-    </>
-  );
-}
