@@ -29,8 +29,8 @@ export default function LandingPage() {
         </h1>
 
         {/* Catalogue note · masthead style */}
-        <p className="font-mono text-[11px] tracking-widest uppercase text-ink-muted mt-10 text-center">
-          一份对话式人格画像 · 中文 · 2026
+        <p className="fraunces-body-soft italic text-[17px] leading-[1.55] text-ink-soft mt-10 text-center max-w-[520px]">
+          原自我 · 从你说的话里，长出你自己本来的样子
         </p>
 
         {/* Entry — small, off-white-on-ink button-less link */}

@@ -9,6 +9,12 @@ interface Props {
    * 草稿持久化 key — 通常传 letterId。每封信独立草稿；不传则不暂存。
    */
   draftKey?: string;
+  /**
+   * 外部预填 · 用 token 触发（而不是内容）——父组件点"话题种子"按钮时，
+   * 传 `{ text, token: Date.now() }` 把文本塞进 textarea 并自动 focus。
+   * 即便 text 相同也能再次触发（例如用户清空了再点同一个种子）。
+   */
+  prefill?: { text: string; token: number } | null;
 }
 
 const DRAFT_PREFIX = "oriself:draft:";
@@ -58,7 +64,7 @@ function writeDraft(key: string, value: string): void {
  *  - ESC = 主动暂存 + 失焦：刷新视觉反馈「刚刚已存」。
  *  - 发送成功后清空草稿。
  */
-export function Composer({ onSend, disabled, draftKey }: Props) {
+export function Composer({ onSend, disabled, draftKey, prefill }: Props) {
   const [text, setText] = useState("");
   const [savedHint, setSavedHint] = useState(false);
   // SSR 时先按非 Mac 渲染（Windows/Linux 占多数），hydrate 后矫正；
@@ -78,6 +84,25 @@ export function Composer({ onSend, disabled, draftKey }: Props) {
     const draft = readDraft(draftKey);
     if (draft) setText(draft);
   }, [draftKey]);
+
+  // 外部预填 · 点话题种子时由父组件触发
+  useEffect(() => {
+    if (!prefill || !prefill.text) return;
+    setText(prefill.text);
+    // focus + 光标移到末尾，方便用户继续编辑
+    requestAnimationFrame(() => {
+      const ta = taRef.current;
+      if (!ta) return;
+      ta.focus();
+      const end = prefill.text.length;
+      try {
+        ta.setSelectionRange(end, end);
+      } catch {
+        /* 某些受控 textarea 可能抛错，忽略 */
+      }
+    });
+    // 依赖 token 而非 text，让同一个种子可以被重复点击
+  }, [prefill?.token]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 自动增高
   useEffect(() => {

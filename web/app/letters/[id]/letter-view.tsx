@@ -10,6 +10,16 @@ import { composeResult, rewriteLastTurn, sendTurnStream } from "@/lib/api";
 import { upsertLetter } from "@/lib/history";
 import type { LetterState, TurnRecord, TurnStatus } from "@/lib/types";
 
+/**
+ * 空态话题种子 · 点一下自动填进 Composer。
+ * 故意不加"/"、"？"、"："等标点——它们是线头，用户接着写自己的细节。
+ */
+const SEED_OPENERS = [
+  "最近在忙的事",
+  "昨晚睡不着时在想的",
+  "这周印象最深的一个画面",
+];
+
 interface Props {
   letterId: string;
   initialState: LetterState;
@@ -45,6 +55,11 @@ export function LetterView({
     initialState.last_status ?? null,
   );
   const [error, setError] = useState<string | null>(null);
+  // 空态话题种子预填 · 用 token 触发，同一种子可重复点
+  const [prefill, setPrefill] = useState<{
+    text: string;
+    token: number;
+  } | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
 
   // 自动滚到最新
@@ -266,6 +281,33 @@ export function LetterView({
             >
               01.
             </span>
+
+            <p className="mt-10 fraunces-body-soft text-[19px] leading-[1.7] text-ink-soft max-w-[520px]">
+              随便聊点最近的事就行。
+              <br />
+              OriSelf 会逐步为你撰写这封属于你一个人的信。
+            </p>
+
+            <div className="mt-12">
+              <p className="font-mono text-[10px] tracking-widest uppercase text-ink-muted mb-4">
+                一时想不起从哪开始 · 点一个自动填到下面
+              </p>
+              <ul className="flex flex-col gap-3 items-start">
+                {SEED_OPENERS.map((seed) => (
+                  <li key={seed}>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setPrefill({ text: seed, token: Date.now() })
+                      }
+                      className="fraunces-body italic text-[17px] text-accent hover:text-accent-soft border-b border-accent/30 hover:border-accent transition-colors pb-[2px] bg-transparent p-0 cursor-pointer text-left"
+                    >
+                      {seed}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
           </div>
         )}
 
@@ -314,6 +356,7 @@ export function LetterView({
           onSend={handleSend}
           disabled={isStreaming}
           draftKey={letterId}
+          prefill={prefill}
         />
       )}
     </>
