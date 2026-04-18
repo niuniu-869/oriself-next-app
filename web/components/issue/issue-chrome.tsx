@@ -109,9 +109,7 @@ export function IssueChrome({ slug, initialIsPublic, letterId }: Props) {
               aria-pressed={isPublic}
               className="hover:text-accent transition-colors disabled:opacity-50 cursor-pointer"
               title={
-                isPublic
-                  ? "当前公开 · 任何人凭链接可看"
-                  : "当前私有 · 仅你可见"
+                isPublic ? "当前公开 · 任何人凭链接可看" : "当前私有 · 仅你可见"
               }
             >
               {isPublic ? "● 公开" : "○ 私有"}
@@ -128,10 +126,14 @@ export function IssueChrome({ slug, initialIsPublic, letterId }: Props) {
             <button
               type="button"
               onClick={() => setFeedbackOpen(true)}
-              className="text-accent hover:text-accent-soft transition-colors cursor-pointer"
-              aria-label="提交反馈"
+              className="group inline-flex items-center gap-[6px] border border-accent/70 hover:border-accent hover:bg-accent/5 text-accent transition-colors px-[10px] py-[5px] rounded-[2px] normal-case tracking-[0.08em] text-[11px] cursor-pointer"
+              aria-label="对这封信提反馈"
+              title="对这封信说一句（匿名，1 分钟就好）"
             >
-              反 馈
+              <span aria-hidden className="font-mono text-[12px] leading-none">
+                ✎
+              </span>
+              <span className="fraunces-body italic">对这封信说一句</span>
             </button>
           </div>
 

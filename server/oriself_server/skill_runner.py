@@ -13,6 +13,7 @@ Skill runner · v2.1/v2.2 主引擎。
 from __future__ import annotations
 
 import datetime as _dt
+import inspect
 import json
 import logging
 import re
@@ -21,7 +22,7 @@ from dataclasses import dataclass
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Awaitable, Callable, List, Optional, Tuple, Union
 
 from .guardrails import (
     OriSelfGuardrails,
@@ -61,6 +62,24 @@ class TurnResult:
     retries: int
     used_fallback: bool
     guardrail_reasons: List[str]
+
+
+# on_phase 回调类型 · 同步或异步皆可，runner 内部会自动 await。
+# 设计这个回调是为了让上层（比如 SSE endpoint）能把 runner 的进展
+# 实时推给前端，让用户"看见模型在想什么"。
+PhaseCallback = Callable[[str, dict], Union[None, Awaitable[None]]]
+
+
+async def _emit(cb: Optional[PhaseCallback], phase: str, data: Optional[dict] = None) -> None:
+    """安全调用 phase 回调。None/同步/异步都兼容。"""
+    if cb is None:
+        return
+    try:
+        result = cb(phase, data or {})
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:  # noqa: BLE001 — 回调异常不该打断主流程
+        logger.debug("on_phase callback raised: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -378,10 +397,22 @@ class SkillRunner:
     # ------------------------------------------------------------------
     # Runtime · step()
     # ------------------------------------------------------------------
-    async def step(self, session: SessionState, user_message_raw: str) -> TurnResult:
+    async def step(
+        self,
+        session: SessionState,
+        user_message_raw: str,
+        *,
+        on_phase: Optional[PhaseCallback] = None,
+    ) -> TurnResult:
         user_message = sanitize_user_input(user_message_raw, max_length=4000)
         round_number = session.round_count + 1
         phase_key = choose_phase_key(session, round_number)
+
+        # Phase: listening · 开始理解用户这轮输入、装配上下文
+        await _emit(on_phase, "listening", {
+            "round": round_number,
+            "phase_key": phase_key,
+        })
 
         last_reasons: List[str] = []
         last_action: Optional[Action] = None
@@ -399,17 +430,30 @@ class SkillRunner:
                         ),
                     )
                 )
+
+            # Phase: thinking · 在调模型。converge 轮耗时显著更长，单独命名。
+            await _emit(on_phase, "thinking", {
+                "attempt": attempt + 1,
+                "is_converge": phase_key == "phase5-converge",
+            })
+
             try:
+                # 不传 max_tokens — 让 provider 用默认（修复 Gemini JSON 截断）
                 raw = await self.backend.complete_json(messages)
             except Exception as exc:
                 last_reasons = [f"LLM backend error: {exc}"]
                 logger.warning("LLM error on attempt %d: %s", attempt + 1, exc)
+                await _emit(on_phase, "retrying", {"attempt": attempt + 1, "reason": "backend error"})
                 continue
+
+            # Phase: validating · 拿到 JSON 了，跑 schema + guardrails
+            await _emit(on_phase, "validating", {"attempt": attempt + 1})
 
             schema_result = self.guardrails.validate_action_schema(raw)
             if not schema_result.passed:
                 last_reasons = schema_result.reasons
                 logger.info("schema check failed attempt %d: %s", attempt + 1, last_reasons)
+                await _emit(on_phase, "retrying", {"attempt": attempt + 1, "reason": "schema"})
                 continue
 
             action = Action.model_validate(raw)
@@ -437,7 +481,15 @@ class SkillRunner:
                 logger.info(
                     "guardrails failed attempt %d: %s", attempt + 1, last_reasons
                 )
+                await _emit(on_phase, "retrying", {"attempt": attempt + 1, "reason": "guardrails"})
                 continue
+
+            # Phase: composed · 成功，action 准备就绪，交给 endpoint 持久化
+            await _emit(on_phase, "composed", {
+                "action_type": action.action,
+                "dimension_targeted": action.dimension_targeted,
+                "evidence_count": len(action.evidence),
+            })
 
             return TurnResult(
                 action=action,
@@ -452,6 +504,7 @@ class SkillRunner:
             round_number,
             last_reasons,
         )
+        await _emit(on_phase, "fallback", {"reasons": last_reasons[:3]})
         return TurnResult(
             action=fallback_action(
                 round_number,

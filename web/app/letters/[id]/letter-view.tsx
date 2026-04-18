@@ -5,7 +5,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Masthead } from "@/components/masthead";
 import { Composer } from "@/components/letter/composer";
 import { Turn } from "@/components/letter/turn";
-import { sendTurn, getResult } from "@/lib/api";
+import { ThinkingTrail } from "@/components/letter/thinking-trail";
+import { sendTurnStream, getResult } from "@/lib/api";
+import type { TurnStreamPhaseEvent } from "@/lib/api";
 import type { LetterState, TurnRecord } from "@/lib/types";
 
 interface Props {
@@ -26,13 +28,14 @@ export function LetterView({ letterId, initialState }: Props) {
   const router = useRouter();
   const [turns, setTurns] = useState<TurnRecord[]>(initialState.turns ?? []);
   const [isThinking, setIsThinking] = useState(false);
+  const [phaseTrail, setPhaseTrail] = useState<TurnStreamPhaseEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll to the freshest turn
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [turns.length, isThinking]);
+  }, [turns.length, isThinking, phaseTrail.length]);
 
   const handleSend = useCallback(
     async (text: string) => {
@@ -46,10 +49,21 @@ export function LetterView({ letterId, initialState }: Props) {
       };
       setTurns((prev) => [...prev, userTurn]);
       setIsThinking(true);
+      setPhaseTrail([]);
       setError(null);
 
       try {
-        const res = await sendTurn(letterId, text.trim());
+        const res = await sendTurnStream(letterId, text.trim(), {
+          onPhase: (evt) => {
+            // 同一 phase 的连续事件压扁成一条，避免 "thinking" 被 retry 打成 N 条
+            setPhaseTrail((prev) => {
+              if (prev.length && prev[prev.length - 1].phase === evt.phase) {
+                return [...prev.slice(0, -1), evt];
+              }
+              return [...prev, evt];
+            });
+          },
+        });
         const { action } = res;
 
         // v2.3：可见文本统一在 next_prompt。converge 不带可见话术（直接跳报告）。
@@ -80,6 +94,7 @@ export function LetterView({ letterId, initialState }: Props) {
         setError(err instanceof Error ? err.message : "发送失败，稍后再试");
       } finally {
         setIsThinking(false);
+        setPhaseTrail([]);
       }
     },
     [letterId, turns.length, isThinking, router],
@@ -131,16 +146,7 @@ export function LetterView({ letterId, initialState }: Props) {
           />
         ))}
 
-        {isThinking && (
-          <div className="mb-14 opacity-70">
-            <p className="fraunces-body text-[20px] leading-[1.62] text-ink">
-              <span className="inline-block">
-                正在听
-                <span className="writing-cursor" />
-              </span>
-            </p>
-          </div>
-        )}
+        {isThinking && <ThinkingTrail trail={phaseTrail} />}
 
         {error && (
           <p className="font-mono text-[11px] tracking-wide uppercase text-accent mt-10">

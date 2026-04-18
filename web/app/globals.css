@@ -79,6 +79,21 @@ body::after {
   color: var(--ink);
 }
 
+/* ═══ Hide scrollbar utility ═══
+   Composer textarea / feedback textarea 用的全平台无可见条策略。
+   Firefox 用 scrollbar-width、IE/Edge 用 -ms-overflow-style、
+   Chromium/WebKit 用 ::-webkit-scrollbar display:none。
+*/
+.no-scrollbar {
+  scrollbar-width: none;         /* Firefox */
+  -ms-overflow-style: none;      /* IE/Edge */
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;                 /* Chrome/Safari/新 Edge */
+  width: 0;
+  height: 0;
+}
+
 /* ═══ Writing cursor (for inline typewriter) ═══ */
 .writing-cursor {
   display: inline-block;

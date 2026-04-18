@@ -14,6 +14,20 @@ interface Props {
 const DRAFT_PREFIX = "oriself:draft:";
 const DRAFT_DEBOUNCE_MS = 400;
 
+/**
+ * 检测用户是不是在 Mac 上。SSR 期间默认非 Mac，首帧 hydrate 后再矫正。
+ * 既然这是纯展示用（快捷键提示文案），首帧闪一下不影响功能。
+ */
+function detectIsMac(): boolean {
+  if (typeof navigator === "undefined") return false;
+  // 先看新 API `navigator.userAgentData.platform`，兼容老的 platform / userAgent
+  const uaDataPlat = (
+    navigator as unknown as { userAgentData?: { platform?: string } }
+  ).userAgentData?.platform;
+  const plat = uaDataPlat ?? navigator.platform ?? navigator.userAgent ?? "";
+  return /Mac|iPhone|iPad|iPod/i.test(plat);
+}
+
 function readDraft(key: string): string {
   if (typeof window === "undefined") return "";
   try {
@@ -47,8 +61,16 @@ function writeDraft(key: string, value: string): void {
 export function Composer({ onSend, disabled, draftKey }: Props) {
   const [text, setText] = useState("");
   const [savedHint, setSavedHint] = useState(false);
+  // SSR 时先按非 Mac 渲染（Windows/Linux 占多数），hydrate 后矫正；
+  // 避免服务端渲染出 ⌘ 后 Windows 用户看到闪屏
+  const [isMac, setIsMac] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const debounceRef = useRef<number | null>(null);
+
+  // 平台检测 · 只跑一次
+  useEffect(() => {
+    setIsMac(detectIsMac());
+  }, []);
 
   // 进入时恢复草稿
   useEffect(() => {
@@ -134,13 +156,21 @@ export function Composer({ onSend, disabled, draftKey }: Props) {
             disabled ? "正在听……" : "写下你想到的第一件事，不必修饰……"
           }
           disabled={disabled}
-          className="w-full bg-transparent fraunces-body-soft text-[20px] leading-[1.55] text-ink resize-none outline-none pt-[6px] pb-[10px] border-b border-rule-strong focus:border-accent transition-colors duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] disabled:opacity-60 placeholder:italic placeholder:text-ink-muted placeholder:opacity-70"
-          style={{ caretColor: "var(--accent)" }}
+          className="no-scrollbar w-full bg-transparent fraunces-body-soft text-[20px] leading-[1.55] text-ink resize-none outline-none pt-[6px] pb-[10px] border-b border-rule-strong focus:border-accent transition-colors duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] disabled:opacity-60 placeholder:italic placeholder:text-ink-muted placeholder:opacity-70"
+          style={{
+            caretColor: "var(--accent)",
+            // 超过 200px 自动滚动但无可见条 · 配合 .no-scrollbar 全平台统一
+            overflowY: "auto",
+            scrollbarWidth: "none",
+            msOverflowStyle: "none",
+          }}
         />
 
         <div className="flex justify-between items-center mt-[14px] font-mono text-[10px] tracking-wide uppercase text-ink-muted">
           <span aria-live="polite">
-            {savedHint ? "已暂存 · 下次回来还在" : "⌘ ↵ 发送 · ESC 暂存"}
+            {savedHint
+              ? "已暂存 · 下次回来还在"
+              : `${isMac ? "⌘" : "Ctrl"} ↵ 发送 · ESC 暂存`}
           </span>
           <button
             onClick={handleSend}

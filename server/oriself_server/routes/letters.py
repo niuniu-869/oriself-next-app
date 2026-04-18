@@ -11,15 +11,20 @@ FastAPI routes · 对话（信件）管理。
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import secrets
 from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from ..database import get_sessionmaker
 from ..guardrails import OriSelfGuardrails, SessionState, Turn
@@ -167,27 +172,21 @@ def create_letter(req: CreateLetterRequest, db: Session = Depends(get_db)):
     )
 
 
-@router.post("/{letter_id}/turn", response_model=TurnResponse)
-async def take_turn(
-    letter_id: str, req: TurnRequest, db: Session = Depends(get_db)
-):
-    session_id = letter_id  # 内部沿用 session_id 变量名
-    sess = db.get(TestSession, session_id)
-    if sess is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    if sess.status == "completed":
-        raise HTTPException(status_code=400, detail="session already completed")
+def _persist_turn(
+    db: Session,
+    sess: TestSession,
+    user_message: str,
+    result,  # SkillRunner 的 TurnResult，避免循环 import 这里用 rt 类型省略
+) -> TurnResponse:
+    """把 runner 产出写入 DB，处理 converge 分支，返回对外响应。
 
+    幂等性：同一 round_number 已存在时抛 409。converge 时附带生成 issue。
+    抽成独立函数让同步 / SSE 两条路径都能复用。
+    """
+    session_id = sess.session_id
     state = _load_session_state(db, session_id)
-
-    bundle = load_skill_bundle()
-    backend = make_backend(sess.provider)
-    runner = SkillRunner(backend=backend, bundle=bundle)
-    result = await runner.step(state, req.user_message)
-
     round_number = state.round_count + 1
 
-    # 幂等性：若这一 round_number 已存在，拒绝（UNIQUE 约束保证，但显式 check 更友好）
     existing = (
         db.query(Conversation)
         .filter(
@@ -205,7 +204,7 @@ async def take_turn(
     conv = Conversation(
         session_id=session_id,
         round_number=round_number,
-        user_message=req.user_message,
+        user_message=user_message,
         action_json=result.action.model_dump_json(),
         action_type=result.action.action,
         dimension_targeted=result.action.dimension_targeted,
@@ -225,15 +224,12 @@ async def take_turn(
             )
         )
 
-    # 若 action=converge，写 TestResult + 标记 session 完成
     if result.action.action == "converge" and result.action.converge_output:
         co = result.action.converge_output
         card_json = co.card.model_dump()
-        # 对 pull_quotes 做 escape
         for pq in card_json.get("pull_quotes", []):
             pq["text"] = escape_user_quote(pq.get("text", ""))
 
-        # 生成唯一 slug（最多重试 3 次，概率上够用）
         slug = None
         for _ in range(3):
             candidate = _generate_issue_slug(co.mbti_type)
@@ -243,9 +239,8 @@ async def take_turn(
                 slug = candidate
                 break
         if slug is None:
-            slug = _generate_issue_slug(co.mbti_type)  # 祈祷一下
+            slug = _generate_issue_slug(co.mbti_type)
 
-        # 二次 sanitize（skill prompt 第一道 + schema 校验第二道 + iframe sandbox 第四道）
         safe_html = sanitize_report_html(co.report_html)
 
         db.add(
@@ -257,11 +252,10 @@ async def take_turn(
                     ensure_ascii=False,
                 ),
                 card_json=json.dumps(card_json, ensure_ascii=False),
-                # Issue 字段 · 用户收敛后就能拿到公开链接
                 issue_slug=slug,
                 issue_title=co.card.title,
                 issue_html=safe_html,
-                issue_is_public=True,  # MVP 默认公开，用户可通过 PATCH 收紧
+                issue_is_public=True,
                 issue_generated_at=datetime.now(timezone.utc),
             )
         )
@@ -275,6 +269,116 @@ async def take_turn(
         used_fallback=result.used_fallback,
         retries=result.retries,
         guardrail_reasons=result.guardrail_reasons,
+    )
+
+
+@router.post("/{letter_id}/turn", response_model=TurnResponse)
+async def take_turn(
+    letter_id: str, req: TurnRequest, db: Session = Depends(get_db)
+):
+    session_id = letter_id  # 内部沿用 session_id 变量名
+    sess = db.get(TestSession, session_id)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    if sess.status == "completed":
+        raise HTTPException(status_code=400, detail="session already completed")
+
+    state = _load_session_state(db, session_id)
+
+    bundle = load_skill_bundle()
+    backend = make_backend(sess.provider)
+    runner = SkillRunner(backend=backend, bundle=bundle)
+    result = await runner.step(state, req.user_message)
+
+    return _persist_turn(db, sess, req.user_message, result)
+
+
+@router.post("/{letter_id}/turn/stream")
+async def take_turn_stream(
+    letter_id: str, req: TurnRequest, db: Session = Depends(get_db)
+):
+    """SSE 版本的 /turn。
+
+    事件（`event: <name>`）：
+    - `phase`：runner 阶段推进（listening → thinking → validating → composed）。
+      data = `{"phase": "...", ...extras}`
+    - `final`：正式 TurnResponse。data 与同步版 /turn 一致。
+    - `error`：失败中断。data = `{"message": "..."}`。
+
+    设计：runner 在后台 task 跑，phase 回调把事件塞进 asyncio.Queue；
+    主 generator 边 drain queue 边 yield。期间定期 emit 注释行作心跳，
+    避免中间代理（Vercel / nginx）buffer 或断线。
+    """
+    sess = db.get(TestSession, letter_id)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    if sess.status == "completed":
+        raise HTTPException(status_code=400, detail="session already completed")
+
+    state = _load_session_state(db, letter_id)
+
+    bundle = load_skill_bundle()
+    backend = make_backend(sess.provider)
+    runner = SkillRunner(backend=backend, bundle=bundle)
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def on_phase(phase: str, data: dict) -> None:
+        await queue.put({"event": "phase", "data": {"phase": phase, **data}})
+
+    async def runner_task():
+        try:
+            result = await runner.step(state, req.user_message, on_phase=on_phase)
+            await queue.put({"event": "__result__", "data": result})
+        except Exception as exc:  # noqa: BLE001 — 把异常平移给 generator
+            logger.exception("runner failure in stream")
+            await queue.put({"event": "__error__", "data": {"message": str(exc)}})
+
+    def sse_pack(event: str, payload: dict) -> str:
+        # SSE 规范：event 单行 + data 单行（或多行 data:）+ 空行分隔。
+        return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    async def event_stream():
+        task = asyncio.create_task(runner_task())
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    # 心跳 · 注释行 SSE 规范里会被客户端忽略但保持连接
+                    yield ": heartbeat\n\n"
+                    continue
+
+                name = item["event"]
+                if name == "__result__":
+                    result = item["data"]
+                    try:
+                        turn_response = _persist_turn(db, sess, req.user_message, result)
+                    except HTTPException as he:
+                        yield sse_pack("error", {"message": he.detail, "status": he.status_code})
+                        return
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception("persist failure in stream")
+                        yield sse_pack("error", {"message": f"persist error: {exc}"})
+                        return
+                    yield sse_pack("final", turn_response.model_dump())
+                    return
+                if name == "__error__":
+                    yield sse_pack("error", item["data"])
+                    return
+                yield sse_pack(name, item["data"])
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",  # 关掉 nginx/ingress buffer
+            "Connection": "keep-alive",
+        },
     )
 
 
