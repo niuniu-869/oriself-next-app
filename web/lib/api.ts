@@ -16,6 +16,7 @@ import type {
   LetterCreateResponse,
   LetterResult,
   LetterState,
+  LetterTranscript,
   TurnResponse,
 } from "./types";
 
@@ -58,6 +59,13 @@ export async function createLetter(
 
 export async function getLetterState(letterId: string): Promise<LetterState> {
   return jsonFetch(`/letters/${letterId}/state`);
+}
+
+/** 拉取一封信的完整对话历史 — 回看场景用。 */
+export async function getLetterTranscript(
+  letterId: string,
+): Promise<LetterTranscript> {
+  return jsonFetch(`/letters/${letterId}/transcript`);
 }
 
 export async function sendTurn(

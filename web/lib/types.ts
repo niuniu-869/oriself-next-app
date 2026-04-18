@@ -68,6 +68,14 @@ export interface LetterState {
   turns?: TurnRecord[]; // populated by the wrapper from /letters/:id (future)
 }
 
+/** /letters/{id}/transcript 的响应 — 历史回看用。 */
+export interface LetterTranscript {
+  letter_id: string;
+  status: "active" | "completed" | "failed";
+  turns: TurnRecord[];
+  issue_slug: string | null;
+}
+
 export interface LetterResult {
   letter_id: string;
   mbti_type: string;

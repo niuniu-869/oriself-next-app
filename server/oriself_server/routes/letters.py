@@ -84,6 +84,25 @@ class StateResponse(BaseModel):
     evidence_count_per_dim: dict
 
 
+class TranscriptTurn(BaseModel):
+    """单条可见 turn — 给 /transcript 用。
+
+    一轮对话会拆成两条：先 you（用户原话）、再 oriself（可见回应）。
+    converge 轮如果没有可见文本，留一句兜底 "信收束了，正在写报告……"。
+    """
+
+    speaker: str  # "you" | "oriself"
+    text: str
+    round: int
+
+
+class TranscriptResponse(BaseModel):
+    letter_id: str
+    status: str
+    turns: List[TranscriptTurn]
+    issue_slug: Optional[str] = None  # 已 converge 时给个直达报告的链接
+
+
 class ResultResponse(BaseModel):
     letter_id: str
     mbti_type: str
@@ -402,6 +421,72 @@ def get_state(letter_id: str, db: Session = Depends(get_db)):
         round_count=state.round_count,
         status=sess.status,
         evidence_count_per_dim=counts,
+    )
+
+
+@router.get("/{letter_id}/transcript", response_model=TranscriptResponse)
+def get_transcript(letter_id: str, db: Session = Depends(get_db)):
+    """回看一封信的完整对话。
+
+    设计：state 端点保持轻量（只回 round 计数 / evidence 维度），不塞历史。
+    历史用单独 endpoint，前端只在"回看对话"场景拉一次。
+    """
+    sess = db.get(TestSession, letter_id)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="letter not found")
+
+    convs = (
+        db.query(Conversation)
+        .filter(Conversation.session_id == letter_id)
+        .order_by(Conversation.round_number.asc())
+        .all()
+    )
+
+    turns: List[TranscriptTurn] = []
+    for c in convs:
+        # user 段
+        if c.user_message:
+            turns.append(
+                TranscriptTurn(
+                    speaker="you",
+                    text=c.user_message,
+                    round=c.round_number,
+                )
+            )
+        # oriself 段 — 从 action_json 抽可见文本，逻辑与前端 letter-view 兜底一致
+        visible: Optional[str] = None
+        if c.action_json:
+            try:
+                action = json.loads(c.action_json)
+            except Exception:
+                action = {}
+            for k in ("next_prompt", "next_question", "echo", "text"):
+                v = action.get(k)
+                if v and isinstance(v, str) and v.strip():
+                    visible = v.strip()
+                    break
+            if visible is None and action.get("action") == "converge":
+                visible = "信收束了，正在写报告……"
+        if visible:
+            turns.append(
+                TranscriptTurn(
+                    speaker="oriself",
+                    text=visible,
+                    round=c.round_number,
+                )
+            )
+
+    # 已 converge 时附带 issue_slug，前端可挂个 "看报告" 入口
+    issue_slug: Optional[str] = None
+    tr = db.query(TestResult).filter(TestResult.session_id == letter_id).first()
+    if tr is not None:
+        issue_slug = tr.issue_slug
+
+    return TranscriptResponse(
+        letter_id=letter_id,
+        status=sess.status,
+        turns=turns,
+        issue_slug=issue_slug,
     )
 
 

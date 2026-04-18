@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Masthead } from "@/components/masthead";
@@ -13,6 +14,8 @@ import type { LetterState, TurnRecord } from "@/lib/types";
 interface Props {
   letterId: string;
   initialState: LetterState;
+  /** 已 converge 的 letter — 渲染"看报告"入口替换 composer。 */
+  issueSlug?: string | null;
 }
 
 /**
@@ -24,8 +27,9 @@ interface Props {
  *  - Composer is a line, not a box.
  *  - On converge, redirect to /issues/:slug.
  */
-export function LetterView({ letterId, initialState }: Props) {
+export function LetterView({ letterId, initialState, issueSlug }: Props) {
   const router = useRouter();
+  const isCompleted = initialState.status === "completed";
   const [turns, setTurns] = useState<TurnRecord[]>(initialState.turns ?? []);
   const [isThinking, setIsThinking] = useState(false);
   const [phaseTrail, setPhaseTrail] = useState<TurnStreamPhaseEvent[]>([]);
@@ -157,7 +161,52 @@ export function LetterView({ letterId, initialState }: Props) {
         <div ref={endRef} />
       </main>
 
-      <Composer onSend={handleSend} disabled={isThinking} draftKey={letterId} />
+      {isCompleted ? (
+        <CompletedFooter issueSlug={issueSlug ?? null} />
+      ) : (
+        <Composer
+          onSend={handleSend}
+          disabled={isThinking}
+          draftKey={letterId}
+        />
+      )}
     </>
+  );
+}
+
+/**
+ * 已收尾的信不再接受输入，给一条克制的回看提示 + 直达报告的入口。
+ * 保持和 Composer 一致的底部 fixed 结构，避免视觉跳变。
+ */
+function CompletedFooter({ issueSlug }: { issueSlug: string | null }) {
+  return (
+    <footer
+      className="fixed left-0 right-0 bottom-0 z-[8] px-8 pt-20 pb-9 pointer-events-none"
+      style={{
+        background:
+          "linear-gradient(to top, var(--paper) 55%, rgba(245, 240, 230, 0.92) 80%, rgba(245, 240, 230, 0))",
+      }}
+    >
+      <div className="max-w-[620px] mx-auto pointer-events-auto flex items-center justify-between gap-6">
+        <p className="font-mono text-[10px] tracking-widest uppercase text-ink-muted">
+          这封信已收尾 · 在回看
+        </p>
+        {issueSlug ? (
+          <Link
+            href={`/issues/${issueSlug}`}
+            className="fraunces-body italic text-[16px] text-accent hover:text-accent-soft border-b border-accent/40 hover:border-accent transition-colors pb-[2px]"
+          >
+            看你的报告 <span className="font-mono not-italic">→</span>
+          </Link>
+        ) : (
+          <Link
+            href="/letters/new"
+            className="fraunces-body italic text-[16px] text-accent hover:text-accent-soft border-b border-accent/40 hover:border-accent transition-colors pb-[2px]"
+          >
+            再写一封 <span className="font-mono not-italic">→</span>
+          </Link>
+        )}
+      </div>
+    </footer>
   );
 }
