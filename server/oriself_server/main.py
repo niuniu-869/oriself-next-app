@@ -13,6 +13,21 @@ FastAPI 入口。
 from __future__ import annotations
 
 import os
+from pathlib import Path
+
+try:
+    # 允许把 .env 放在项目根或 server/ 下，启动时自动加载。
+    # 找不到 dotenv 不阻断——生产也可用 shell 导出 env。
+    from dotenv import load_dotenv
+
+    for candidate in (
+        Path(__file__).resolve().parents[2] / ".env",  # <repo>/.env
+        Path(__file__).resolve().parents[1] / ".env",  # <repo>/server/.env
+    ):
+        if candidate.exists():
+            load_dotenv(candidate, override=False)
+except ImportError:
+    pass
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

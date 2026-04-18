@@ -404,10 +404,18 @@ def _parse_json_safe(content: str) -> dict:
 
 PROVIDER_PRESETS: dict[str, dict] = {
     "gemini": {
-        "base_url": os.environ.get("ORISELF_GEMINI_BASE_URL", "https://api.302.ai/v1"),
+        # base_url 必须来自 env（ORISELF_GEMINI_BASE_URL 或 GEMINI_BASE_URL）。
+        # 不给 302.ai 之类的公共默认，防止用户忘了配时走到错误代理。
+        "base_url": (
+            os.environ.get("ORISELF_GEMINI_BASE_URL")
+            or os.environ.get("GEMINI_BASE_URL")
+            or ""  # 空串 → make_backend 里会报错
+        ),
         "model_env": "ORISELF_GEMINI_MODEL",
         "default_model": "gemini-3-flash-preview",
+        # api_key 同时接受 ORISELF_GEMINI_API_KEY / GEMINI_API_KEY
         "api_key_env": "ORISELF_GEMINI_API_KEY",
+        "api_key_env_fallback": "GEMINI_API_KEY",
     },
     "qwen": {
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -444,10 +452,18 @@ def make_backend(provider: str) -> LLMBackend:
     if preset is None:
         raise ValueError(f"unknown provider: {provider}")
     api_key = os.environ.get(preset["api_key_env"])
+    if not api_key and preset.get("api_key_env_fallback"):
+        api_key = os.environ.get(preset["api_key_env_fallback"])
     if not api_key:
         raise RuntimeError(
             f"missing env {preset['api_key_env']} for provider={provider}. "
             f"设置后重试，或改用 provider=mock。"
+        )
+    if not preset["base_url"]:
+        raise RuntimeError(
+            f"missing env ORISELF_{provider.upper()}_BASE_URL / "
+            f"{provider.upper()}_BASE_URL for provider={provider}. "
+            "设置后重试。"
         )
     model = os.environ.get(preset["model_env"], preset["default_model"])
     return OpenAICompatibleBackend(
