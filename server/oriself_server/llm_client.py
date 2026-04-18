@@ -65,8 +65,6 @@ class LLMBackend(ABC):
         messages: List[Message],
         *,
         response_schema: Optional[dict] = None,
-        max_tokens: int = 1200,
-        temperature: float = 0.7,
     ) -> dict:
         """一次请求，返回解析后的 JSON dict。失败抛异常。"""
         ...
@@ -105,19 +103,12 @@ class OpenAICompatibleBackend(LLMBackend):
         messages: List[Message],
         *,
         response_schema: Optional[dict] = None,
-        max_tokens: int = 1200,
-        temperature: Optional[float] = None,  # 留着是签名兼容性，默认不传
     ) -> dict:
-        # v2.2.3+ · 不再强制 temperature；走 provider 自己的默认。
-        # 如果调用方明确传了 temperature 才加进 payload。
         payload: dict = {
             "model": self.model,
             "messages": [{"role": m.role, "content": m.content} for m in messages],
-            "max_tokens": max_tokens,
             "response_format": {"type": "json_object"},
         }
-        if temperature is not None:
-            payload["temperature"] = temperature
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(
                 f"{self.base_url}/chat/completions",
@@ -155,8 +146,6 @@ class MockBackend(LLMBackend):
         messages: List[Message],
         *,
         response_schema: Optional[dict] = None,
-        max_tokens: int = 1200,
-        temperature: float = 0.7,
     ) -> dict:
         # 从 messages 里估算当前是第几轮（user 消息个数）
         user_rounds = [m for m in messages if m.role == "user"]
@@ -434,6 +423,12 @@ def _parse_json_safe(content: str) -> dict:
 
 
 PROVIDER_PRESETS: dict[str, dict] = {
+    "gemini": {
+        "base_url": os.environ.get("ORISELF_GEMINI_BASE_URL", "https://api.302.ai/v1"),
+        "model_env": "ORISELF_GEMINI_MODEL",
+        "default_model": "gemini-3-flash-preview",
+        "api_key_env": "ORISELF_GEMINI_API_KEY",
+    },
     "qwen": {
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "model_env": "ORISELF_QWEN_MODEL",

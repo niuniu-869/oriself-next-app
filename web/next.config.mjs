@@ -1,6 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  allowedDevOrigins: ['next.oriself.com'],
 
   // API proxy: avoid exposing backend URL to client; iframe still hits backend directly.
   async rewrites() {

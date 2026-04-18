@@ -383,13 +383,6 @@ class SkillRunner:
         round_number = session.round_count + 1
         phase_key = choose_phase_key(session, round_number)
 
-        # v2.2 · converge 轮要生成完整 HTML，默认 1200 tokens 不够
-        # DeepSeek-chat 单次输出 hard cap = 8192 tokens，留一点 buffer
-        if phase_key == "phase5-converge":
-            max_tokens = 8000
-        else:
-            max_tokens = 1200
-
         last_reasons: List[str] = []
         last_action: Optional[Action] = None
 
@@ -407,7 +400,7 @@ class SkillRunner:
                     )
                 )
             try:
-                raw = await self.backend.complete_json(messages, max_tokens=max_tokens)
+                raw = await self.backend.complete_json(messages)
             except Exception as exc:
                 last_reasons = [f"LLM backend error: {exc}"]
                 logger.warning("LLM error on attempt %d: %s", attempt + 1, exc)
