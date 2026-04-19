@@ -1,5 +1,5 @@
-import Link from 'next/link';
-import type { ReactNode } from 'react';
+import Link from "next/link";
+import type { ReactNode } from "react";
 
 /**
  * Masthead · the whisper-loud header shown on letter and issue pages.
@@ -16,16 +16,16 @@ export function Masthead({
 }) {
   return (
     <header
-      className="fixed top-0 left-0 right-0 z-10 px-10 py-[22px] flex items-baseline justify-between pointer-events-none"
+      className="fixed top-0 left-0 right-0 z-10 px-5 sm:px-10 py-[18px] sm:py-[22px] flex items-baseline justify-between gap-3 pointer-events-none"
       style={{
         background:
-          'linear-gradient(to bottom, var(--paper) 60%, rgba(245, 240, 230, 0))',
+          "linear-gradient(to bottom, var(--paper) 60%, rgba(245, 240, 230, 0))",
       }}
     >
       <Link
         href="/"
         className="fraunces-brand text-[18px] tracking-tighter text-ink pointer-events-auto"
-        style={{ textDecoration: 'none' }}
+        style={{ textDecoration: "none" }}
       >
         OriSelf
       </Link>

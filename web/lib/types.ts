@@ -20,11 +20,18 @@ export interface TurnDonePayload {
   visible: string;
 }
 
+/** SSE `event: quill` payload · token 流出前一次，0..2 条铅笔批注。 */
+export interface QuillFrame {
+  lines: string[];
+}
+
 /** 对话轮记录 · 前端渲染用（服务端 transcript 已剥除 STATUS）。 */
 export interface TurnRecord {
   speaker: "oriself" | "you";
   text: string;
   round: number;
+  /** v2.5.3 · Oriself 本轮的笔触批注（仅 oriself 行可能有；与后端字段名对齐）。 */
+  quill_lines?: string[] | null;
 }
 
 export interface LetterState {
@@ -44,12 +51,11 @@ export interface LetterTranscript {
   issue_slug: string | null;
 }
 
-/** /letters/{id}/result */
+/** /letters/{id}/result · v2.5.2 极简：HTML 是唯一产物，结构化字段不再返回 */
 export interface LetterResult {
   letter_id: string;
   mbti_type: string;
-  insight_paragraphs: Array<{ theme: string; body: string; quoted_rounds: number[] }>;
-  card: Record<string, unknown>;
+  card_title: string | null;
   issue_slug: string | null;
 }
 

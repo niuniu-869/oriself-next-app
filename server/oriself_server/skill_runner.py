@@ -1,5 +1,5 @@
 """
-Skill runner · v2.4 主引擎。
+Skill runner · v2.5.2 主引擎。
 
 设计：
 - 对话轮 (`TurnRunner.stream_turn`) · 流式文本 async generator
@@ -8,10 +8,11 @@ Skill runner · v2.4 主引擎。
     - 调 backend.stream_text()，token 透传给上层
     - stream 结束后从尾部解析 STATUS sentinel，剥除，返回 ParsedTurn
     - **不 retry，不 fallback**。LLM 输出什么用户就看到什么。不满意由前端点「重写」。
-- 报告轮 (`ReportRunner.compose`) · 唯一保留 schema + 3 次 retry
+- 报告轮 (`ReportRunner.compose`) · v2.5.2 · LLM 直吐 HTML
     - 独立 prompt：CONVERGE.md + domain + 元数据（session_id_short / today）
-    - 调 backend.complete_json()，Pydantic 校验，guardrails 校验
-    - 全部失败返 None，由 routes 层告诉用户「报告生成卡住了」
+    - 调 backend.complete_text()，拿原始文本
+    - 剥 markdown fence → shape/parse/extract/consistency 链
+    - 最多 3 次 retry；失败返回 None，由 routes 层告诉用户「报告生成卡住了」
 """
 from __future__ import annotations
 
@@ -24,15 +25,20 @@ from typing import AsyncIterator, List, Optional, Tuple
 from .guardrails import (
     ParsedTurn,
     parse_status_sentinel,
-    verify_report_html_consistency,
+    resolve_mbti_or_fail,
+    strip_markdown_fence,
+    verify_report_html_parseable,
     verify_report_html_shape,
+    extract_card_title_from_html,
 )
 from .llm_client import LLMBackend, Message
+from .quill import derive_lines as _derive_quill_lines
 from .schemas import (
     ConvergeOutput,
     MAX_ROUNDS,
     ONBOARDING_ROUND,
     REPORT_MAX_RETRIES,
+    REPORT_TIMEOUT_SEC,
     UserPreferences,
     effective_target_rounds,
 )
@@ -56,6 +62,7 @@ class Turn:
     oriself_text: str = ""          # LLM 的可见文本（已剥 STATUS）
     status: str = "CONTINUE"        # CONTINUE / CONVERGE / NEED_USER
     discarded: bool = False         # 用户点「重写」后旧轮标这个
+    quill_lines: List[str] = field(default_factory=list)  # v2.5.3 · 本轮给用户看的笔触批注
 
 
 @dataclass
@@ -86,38 +93,64 @@ def _near_end_round(target: int) -> int:
     return max(_midpoint_round(target) + 2, target - 2)
 
 
-def choose_phase_key(session: SessionState, current_round: int) -> str:
-    """选本轮应加载的 phase 文件。
+def _collect_seen_from_history(
+    session: SessionState,
+    bundle: SkillBundle,
+) -> Tuple[set, set]:
+    """从 live turns 反推这封信里已经出现过的 phase / technique 集合。
 
-    - R1 → phase0-onboarding
-    - R_mid（target/2）且未做过 → phase3_5-midpoint
-    - R_near（target-2）且未做过 → phase4_8-soft-closing
-    - midpoint 之后 → phase4-deep
-    - 否则 → phase1-warmup 或 phase2-3-exploring
+    用途：quill 行"同 phase / 同 technique 只显示一次"的去重判定。
+    注意 preferences 在 R2 前是 None，所以 R1 的 phase 算出来就是 phase-onboarding，
+    不会漂移；后续 target_rounds 变化只会影响 midpoint / near_end 的具体轮号，
+    不会让"已出现过"判定产生重复行。
+    """
+    seen_phases: set = set()
+    seen_techs: set = set()
+    for t in session.live_turns():
+        pk = choose_phase_key(session, t.round_number)
+        if not pk:
+            continue
+        seen_phases.add(pk)
+        ref = bundle.refs.get(pk)
+        if ref is None:
+            continue
+        needs = ref.meta.get("needs") or []
+        if isinstance(needs, list):
+            for n in needs:
+                if n:
+                    seen_techs.add(str(n))
+    return seen_phases, seen_techs
+
+
+def choose_phase_key(session: SessionState, current_round: int) -> str:
+    """选本轮应加载的 phase 文件（v2.5.0 命名，去掉数字前缀）。
+
+    - R1 → phase-onboarding
+    - R_mid（target/2）且未做过 → phase-midpoint
+    - R_near（target-2）且未做过 → phase-soft-closing
+    - midpoint 之后 → phase-deep
+    - 否则 → phase-warmup（R≤3）或 phase-exploring
     """
     if current_round == ONBOARDING_ROUND:
-        return "phase0-onboarding"
+        return "phase-onboarding"
 
     target = effective_target_rounds(session.user_preferences)
     mid = _midpoint_round(target)
     near = _near_end_round(target)
 
-    live = session.live_turns()
-    seen_midpoint = any("3_5-midpoint" in t.oriself_text[:0] for t in live)  # placeholder
-    # v2.4 · 我们不再把 phase action_type 写进 turn；用轮号判断是否走过
-    # 简化：如果已经过了 mid 轮数，就按 mid 走过了算
+    # v2.4 · 不再把 phase action_type 写进 turn；用轮号判断是否走过
     did_midpoint = current_round > mid
     did_soft_closing = current_round > near
 
     if current_round == mid and not did_midpoint:
-        return "phase3_5-midpoint"
+        return "phase-midpoint"
     if current_round == near and not did_soft_closing:
-        return "phase4_8-soft-closing"
+        return "phase-soft-closing"
     if current_round > mid:
-        return "phase4-deep"
+        return "phase-deep"
     if current_round <= 3:
-        return "phase1-warmup"
-    return "phase2-3-exploring"
+        return "phase-warmup"
+    return "phase-exploring"
 
 
 # ---------------------------------------------------------------------------
@@ -182,8 +215,17 @@ class TurnRunner:
         system_prompt = self.bundle.compose_conversation_prompt(
             domain=session.domain,
             phase_key=phase_key,
+            current_round=current_round,
         )
         system_prompt += _runtime_state_block(session, current_round, phase_key)
+
+        # v2.5.0 观测：打印每轮 system prompt 字节数，便于调优 progressive disclosure
+        logger.info(
+            "[skill-compose] round=%d phase=%s system_bytes=%d",
+            current_round,
+            phase_key,
+            len(system_prompt.encode("utf-8")),
+        )
 
         msgs: List[Message] = [
             Message(role="system", content=system_prompt, cache_breakpoint=True),
@@ -201,10 +243,11 @@ class TurnRunner:
         user_message_raw: str,
         *,
         rewrite_hint: Optional[str] = None,
-    ) -> AsyncIterator[Tuple[str, str]]:
+    ) -> AsyncIterator[Tuple[str, object]]:
         """对话轮 · 流式生成。
 
         yields tuples of (kind, payload):
+          - ("quill", List[str]) · token 开始前的笔触批注（0..2 条）
           - ("token", str) · token chunk，直接透传给用户
           - ("final",  "")  · 流结束前的标记（紧跟 status + visible）
           - ("status", CONTINUE/CONVERGE/NEED_USER)
@@ -212,6 +255,26 @@ class TurnRunner:
           - ("error", err_message)
         """
         user_message = sanitize_user_input(user_message_raw, max_length=4000)
+        # 先算 quill（token 之前就要给前端，制造"Oriself 在落笔前停了一下"的节奏）
+        current_round = session.round_count + 1
+        phase_key = choose_phase_key(session, current_round)
+        phase_ref = self.bundle.refs.get(phase_key)
+        needs_list: List[str] = []
+        if phase_ref is not None:
+            raw_needs = phase_ref.meta.get("needs") or []
+            if isinstance(raw_needs, list):
+                needs_list = [str(n) for n in raw_needs if n]
+        seen_phases, seen_techniques = _collect_seen_from_history(
+            session, self.bundle
+        )
+        quill_lines, _, _ = _derive_quill_lines(
+            phase_key=phase_key,
+            needs=needs_list,
+            seen_phases=seen_phases,
+            seen_techniques=seen_techniques,
+        )
+        yield ("quill", quill_lines)
+
         messages = self._build_conversation_messages(session, user_message)
         if rewrite_hint:
             # 给 LLM 一个显式的"上一次不好"提示
@@ -308,44 +371,76 @@ class ReportRunner:
         return msgs
 
     async def compose(self, session: SessionState) -> ReportResult:
+        """v2.5.2 · LLM 直吐 HTML，不走 JSON。
+
+        校验链（任一失败即 retry）：
+        1. backend 调用本身（网络 / timeout / 4xx）
+        2. strip_markdown_fence（剥潜在 ```html … ``` 包装）
+        3. verify_report_html_shape（doctype / html / 无 script/iframe / 无模板占位）
+        4. verify_report_html_parseable（html.parser 能扫完 + 可见文本 ≥ 30 字符）
+        5. resolve_mbti_or_fail（可见文本里有且仅有一个 4 字母 MBTI）
+        6. 抽 <title> 作为 card_title
+        """
         last_reasons: List[str] = []
         for attempt in range(REPORT_MAX_RETRIES):
             hint = "\n".join(last_reasons[:5]) if attempt > 0 else None
             messages = self._build_converge_messages(session, retry_hint=hint)
+
             try:
-                raw = await self.backend.complete_json(messages)
+                raw = await self.backend.complete_text(
+                    messages, timeout=REPORT_TIMEOUT_SEC
+                )
             except Exception as exc:
                 last_reasons = [f"LLM backend error: {exc}"]
                 logger.warning("converge attempt %d backend error: %s", attempt + 1, exc)
                 continue
 
-            try:
-                output = ConvergeOutput.model_validate(raw)
-            except Exception as exc:
-                last_reasons = [f"schema invalid: {exc}"]
-                logger.info("converge attempt %d schema fail: %s", attempt + 1, last_reasons)
-                continue
+            html = strip_markdown_fence(raw or "").strip()
 
-            # 安全 + 一致性
-            shape = verify_report_html_shape(output.report_html)
+            shape = verify_report_html_shape(html)
             if not shape.passed:
                 last_reasons = shape.reasons
-                logger.info("converge attempt %d html-shape fail: %s", attempt + 1, last_reasons)
+                logger.info(
+                    "converge attempt %d html-shape fail: %s", attempt + 1, last_reasons
+                )
                 continue
 
-            consistency = verify_report_html_consistency(
-                output.report_html, output.mbti_type or ""
-            )
-            if not consistency.passed:
-                last_reasons = consistency.reasons
+            parseable = verify_report_html_parseable(html)
+            if not parseable.passed:
+                last_reasons = parseable.reasons
                 logger.info(
-                    "converge attempt %d html-consistency fail: %s", attempt + 1, last_reasons
+                    "converge attempt %d html-parse fail: %s", attempt + 1, last_reasons
+                )
+                continue
+
+            mbti_type, mbti_result = resolve_mbti_or_fail(html)
+            if not mbti_result.passed or mbti_type is None:
+                last_reasons = mbti_result.reasons
+                logger.info(
+                    "converge attempt %d mbti-resolve fail: %s", attempt + 1, last_reasons
+                )
+                continue
+
+            card_title = extract_card_title_from_html(html)
+
+            try:
+                output = ConvergeOutput(
+                    mbti_type=mbti_type,
+                    card_title=card_title,
+                    report_html=html,
+                )
+            except Exception as exc:
+                last_reasons = [f"ConvergeOutput validate: {exc}"]
+                logger.info(
+                    "converge attempt %d schema fail: %s", attempt + 1, last_reasons
                 )
                 continue
 
             return ReportResult(output=output, retries=attempt, error_reasons=[])
 
-        return ReportResult(output=None, retries=REPORT_MAX_RETRIES, error_reasons=last_reasons)
+        return ReportResult(
+            output=None, retries=REPORT_MAX_RETRIES, error_reasons=last_reasons
+        )
 
 
 # ---------------------------------------------------------------------------

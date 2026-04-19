@@ -95,19 +95,20 @@ def test_html_consistency_ok():
 
 def test_phase_r1_onboarding():
     s = SessionState(session_id="x", domain="mbti")
-    assert choose_phase_key(s, 1) == "phase0-onboarding"
+    # v2.5.0 · phase 命名去掉数字前缀
+    assert choose_phase_key(s, 1) == "phase-onboarding"
 
 
 def test_phase_midpoint():
     prefs = UserPreferences(target_rounds=20)
     s = SessionState(session_id="x", domain="mbti", user_preferences=prefs)
-    assert choose_phase_key(s, 10) == "phase3_5-midpoint"
+    assert choose_phase_key(s, 10) == "phase-midpoint"
 
 
 def test_phase_soft_closing():
     prefs = UserPreferences(target_rounds=20)
     s = SessionState(session_id="x", domain="mbti", user_preferences=prefs)
-    assert choose_phase_key(s, 18) == "phase4_8-soft-closing"
+    assert choose_phase_key(s, 18) == "phase-soft-closing"
 
 
 # ---------------------------------------------------------------------------

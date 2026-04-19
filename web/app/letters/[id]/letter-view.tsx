@@ -6,6 +6,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Masthead } from "@/components/masthead";
 import { Composer } from "@/components/letter/composer";
 import { Turn } from "@/components/letter/turn";
+import { AuthorModal } from "@/components/primitives/author-modal";
 import { composeResult, rewriteLastTurn, sendTurnStream } from "@/lib/api";
 import { upsertLetter } from "@/lib/history";
 import type { LetterState, TurnRecord, TurnStatus } from "@/lib/types";
@@ -55,6 +56,9 @@ export function LetterView({
     initialState.last_status ?? null,
   );
   const [error, setError] = useState<string | null>(null);
+  const [authorOpen, setAuthorOpen] = useState(false);
+  // halt（NEED_USER）横幅的"暂隐"状态：点「还想接着写」后隐藏，直到下一次 LLM 再喊 halt
+  const [haltDismissed, setHaltDismissed] = useState(false);
   // 空态话题种子预填 · 用 token 触发，同一种子可重复点
   const [prefill, setPrefill] = useState<{
     text: string;
@@ -99,6 +103,18 @@ export function LetterView({
     });
   }, []);
 
+  const attachQuillLines = useCallback((lines: string[]) => {
+    // SSE 的 quill 帧在 token 之前到达；把它挂到当前流式中的 oriself turn 上，
+    // QuillNote 会在 token 出来之前就淡入，保持"落笔前停一下"的节奏。
+    setTurns((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      if (last.speaker !== "oriself") return prev;
+      const updated = { ...last, quill_lines: lines };
+      return [...prev.slice(0, -1), updated];
+    });
+  }, []);
+
   const finalizeOriselfTurn = useCallback((visible: string, round: number) => {
     setTurns((prev) => {
       if (prev.length === 0) return prev;
@@ -106,7 +122,8 @@ export function LetterView({
       if (last.speaker !== "oriself") return prev;
       return [
         ...prev.slice(0, -1),
-        { speaker: "oriself", text: visible, round },
+        // 保留流式中拿到的 quillLines；visible 覆盖原文（剥 STATUS 之后的版本）
+        { ...last, speaker: "oriself", text: visible, round },
       ];
     });
   }, []);
@@ -115,19 +132,15 @@ export function LetterView({
     try {
       const result = await composeResult(letterId);
       if (result.issue_slug) {
-        const cardTitle =
-          result.card &&
-          typeof (result.card as { title?: unknown }).title === "string"
-            ? (result.card as { title: string }).title
-            : undefined;
         upsertLetter({
           letterId,
           status: "completed",
           issueSlug: result.issue_slug,
           mbtiType: result.mbti_type,
-          cardTitle,
+          cardTitle: result.card_title ?? undefined,
         });
-        router.push(`/issues/${result.issue_slug}`);
+        // ?arrived=1 触发 issue 页的封缄时刻；之后 router.replace 会把它抹掉
+        router.push(`/issues/${result.issue_slug}?arrived=1`);
       } else {
         setError("报告生成成功但没有 issue slug，请刷新页面");
       }
@@ -158,9 +171,12 @@ export function LetterView({
       try {
         const done = await sendTurnStream(letterId, text.trim(), {
           onToken: appendOriselfToken,
+          onQuill: attachQuillLines,
         });
         finalizeOriselfTurn(done.visible, done.round);
         setLastStatus(done.status);
+        // 新的 halt 到来 → 让 banner 重新显示（用户之前即使 dismiss 过，这次要再给出口）
+        if (done.status === "NEED_USER") setHaltDismissed(false);
         upsertLetter({
           letterId,
           roundCount: done.round,
@@ -181,6 +197,7 @@ export function LetterView({
       isStreaming,
       openOriselfStreamingTurn,
       appendOriselfToken,
+      attachQuillLines,
       finalizeOriselfTurn,
       handleConverge,
     ],
@@ -211,9 +228,11 @@ export function LetterView({
     try {
       const done = await rewriteLastTurn(letterId, {
         onToken: appendOriselfToken,
+        onQuill: attachQuillLines,
       });
       finalizeOriselfTurn(done.visible, done.round);
       setLastStatus(done.status);
+      if (done.status === "NEED_USER") setHaltDismissed(false);
       upsertLetter({
         letterId,
         roundCount: done.round,
@@ -233,6 +252,7 @@ export function LetterView({
     turns,
     openOriselfStreamingTurn,
     appendOriselfToken,
+    attachQuillLines,
     finalizeOriselfTurn,
     handleConverge,
   ]);
@@ -262,7 +282,19 @@ export function LetterView({
             </span>
           </>
         }
+        actions={
+          <button
+            type="button"
+            onClick={() => setAuthorOpen(true)}
+            className="font-mono text-[10px] tracking-widest uppercase text-ink-muted hover:text-accent transition-colors bg-transparent border-0"
+            aria-label="关于作者"
+          >
+            AUTHOR
+          </button>
+        }
       />
+
+      <AuthorModal open={authorOpen} onClose={() => setAuthorOpen(false)} />
 
       <main className="relative z-10 max-w-[620px] mx-auto px-8 pt-[140px] pb-[260px]">
         {turns.length === 0 && (
@@ -334,10 +366,39 @@ export function LetterView({
           );
         })}
 
-        {lastStatus === "NEED_USER" && !isStreaming && (
-          <p className="font-mono text-[11px] tracking-wide uppercase text-accent mt-4">
-            TA 好像在等你多说一点 —— 聊到哪都行。
-          </p>
+        {lastStatus === "NEED_USER" && !isStreaming && !haltDismissed && (
+          <div className="mt-12 mb-8 border-t border-b border-rule/30 py-7">
+            <p className="font-mono text-[10px] tracking-widest uppercase text-ink-muted mb-3">
+              Oriself 想说一句
+            </p>
+            <p className="fraunces-body-soft text-[17px] leading-[1.75] text-ink max-w-[540px] mb-6">
+              先停一下吧 —— 聊到这儿有点卡。这封信已经留着，你不用现在就接下去。
+              想再接着写一句什么都行；想歇会儿的话，之后从首页「最近的信」能直接回到这里。
+            </p>
+            <div className="flex items-center gap-7 flex-wrap">
+              <button
+                type="button"
+                onClick={() => setHaltDismissed(true)}
+                className="fraunces-body italic text-[15px] text-accent hover:text-accent-soft border-b border-accent/40 hover:border-accent transition-colors pb-[2px] bg-transparent p-0 cursor-pointer"
+              >
+                还想接着写 <span className="not-italic">→</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  upsertLetter({
+                    letterId,
+                    roundCount: currentRound,
+                    status: "active",
+                  });
+                  router.push("/");
+                }}
+                className="font-mono text-[10px] tracking-widest uppercase text-ink-muted hover:text-accent transition-colors bg-transparent border-0 cursor-pointer p-0"
+              >
+                先到这里 ↩
+              </button>
+            </div>
+          </div>
         )}
 
         {error && (

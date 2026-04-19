@@ -98,12 +98,9 @@ async def run_cli(provider: str, domain: str) -> int:
                 return 1
             co = result.output
             print(f"\nMBTI · {co.mbti_type}")
-            print(f"Card: {co.card.title}")
-            print(f"Subtitle: {co.card.subtitle}")
-            for i, p in enumerate(co.insight_paragraphs, start=1):
-                print(f"\n  [{i}] {p.theme}")
-                print(f"      {p.body}")
-            print(f"\n(report_html: {len(co.report_html)} chars)")
+            if co.card_title:
+                print(f"Title: {co.card_title}")
+            print(f"(report_html: {len(co.report_html)} chars)")
             return 0
 
         if session.round_count >= 30:

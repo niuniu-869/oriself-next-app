@@ -1,12 +1,17 @@
 """
-多 provider LLM 客户端 · v2.4。
+多 provider LLM 客户端 · v2.5.2。
 
-v2.4 变化：
+v2.5.2 变化：
+- converge 不再走 JSON schema：`complete_json` → `complete_text`，返回整段字符串
+  （LLM 直吐 HTML）。服务端从 HTML 抽 MBTI + title，见 guardrails.py
+- 默认 converge timeout 从 120s 提到 300s（长 HTML 生成 + 后端长尾）
+
+v2.4 保留：
 - 每个 backend 暴露两个方法：
-    * `stream_text(messages)` → `AsyncIterator[str]` · 对话轮专用，SSE token 流
-    * `complete_json(messages)` → `dict` · 仅报告生成（converge）用
-- 对话轮不再要 JSON，provider 侧不再传 `response_format`
-- MockBackend 产出带 `STATUS: ...` 末行的纯文本，以及 converge JSON
+    * `stream_text(messages)` → `AsyncIterator[str]` · 对话轮 SSE
+    * `complete_text(messages)` → `str` · 报告生成（converge）
+- 对话轮不再要 JSON，provider 侧不传 `response_format`
+- MockBackend 产出带 `STATUS: ...` 末行的文本；converge 产 HTML
 
 支持的 provider：
 - `openai_compatible`（Qwen / DeepSeek / Kimi / OpenAI / 302.ai Gemini 等兼容端）
@@ -17,10 +22,9 @@ from __future__ import annotations
 import json
 import os
 import random
-import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import AsyncIterator, List, Optional
+from typing import AsyncIterator, List
 
 import httpx
 
@@ -56,14 +60,13 @@ class LLMBackend(ABC):
         ...
 
     @abstractmethod
-    async def complete_json(
+    async def complete_text(
         self,
         messages: List[Message],
         *,
-        response_schema: Optional[dict] = None,
-        timeout: float = 120.0,
-    ) -> dict:
-        """仅报告生成用 · 一次请求返回解析后的 JSON dict。失败抛异常。"""
+        timeout: float = 300.0,
+    ) -> str:
+        """报告轮 · 一次请求返回完整文本（HTML）。失败抛异常。"""
         ...
 
 
@@ -143,18 +146,16 @@ class OpenAICompatibleBackend(LLMBackend):
                     if chunk:
                         yield chunk
 
-    # ---- 报告轮 · 非流式 JSON ----
-    async def complete_json(
+    # ---- 报告轮 · 非流式，返回原始文本 ----
+    async def complete_text(
         self,
         messages: List[Message],
         *,
-        response_schema: Optional[dict] = None,
-        timeout: float = 120.0,
-    ) -> dict:
+        timeout: float = 300.0,
+    ) -> str:
         payload: dict = {
             "model": self.model,
             "messages": [{"role": m.role, "content": m.content} for m in messages],
-            "response_format": {"type": "json_object"},
         }
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
@@ -168,7 +169,9 @@ class OpenAICompatibleBackend(LLMBackend):
             resp.raise_for_status()
             data = resp.json()
         content = data["choices"][0]["message"]["content"]
-        return _parse_json_safe(content)
+        if not isinstance(content, str):
+            raise ValueError(f"LLM returned non-string content: {type(content)}")
+        return content
 
 
 # ---------------------------------------------------------------------------
@@ -204,12 +207,86 @@ _MOCK_TURN_SCRIPTS = [
 ]
 
 
+_MOCK_CONVERGE_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>一个安静的栏目</title>
+  <style>
+    body{background:#08080f;color:#c8cdd8;margin:0;
+         font-family:'Noto Serif SC',-apple-system,serif;}
+    main{max-width:720px;margin:auto;padding:40px;}
+    h1{font-size:3rem;font-weight:800;letter-spacing:-0.03em;margin:0 0 16px;}
+    .mbti{font-size:5rem;font-weight:800;color:#818cf8;
+          font-family:'JetBrains Mono',ui-monospace,monospace;letter-spacing:0.05em;}
+    .section{padding:32px;background:rgba(15,15,25,0.6);
+             border:1px solid rgba(255,255,255,0.06);margin:20px 0;border-radius:16px;}
+    .num{font-size:0.7rem;letter-spacing:0.12em;color:#5a5e72;display:block;margin-bottom:12px;}
+    blockquote{background:rgba(129,140,248,0.06);border-left:2px solid #818cf8;
+               padding:12px 16px;margin:10px 0;border-radius:8px;}
+    blockquote span{display:inline-block;color:#c084fc;margin-right:12px;
+                    font-family:'JetBrains Mono',monospace;font-size:0.75rem;}
+    .dim{display:grid;grid-template-columns:60px 1fr 60px;gap:12px;
+         align-items:center;margin:8px 0;}
+    .dim-letter{font-family:'JetBrains Mono',monospace;color:#818cf8;}
+    .bar{height:4px;background:rgba(255,255,255,0.08);border-radius:2px;overflow:hidden;}
+    .bar-fill{height:100%;background:#818cf8;}
+    .foot{margin-top:48px;color:#5a5e72;font-size:0.85rem;}
+  </style>
+</head>
+<body>
+  <main>
+    <section>
+      <div class="mbti">INTJ</div>
+      <h1>一个安静的栏目</h1>
+      <p style="color:#c084fc;">mock · 演示用名片</p>
+    </section>
+    <section class="section">
+      <span class="num">01 · 看起来的你</span>
+      <p>这是 mock 生成的第一段洞见占位文本。正式版由 LLM 按 CONVERGE.md 指导生成。
+      这里多铺一些字数让它读起来像真的一段话。<sup>R1</sup></p>
+    </section>
+    <section class="section">
+      <span class="num">02 · 停了一下</span>
+      <p>第二段 mock 占位。真实版这里会写 TA 的矛盾或反差。再补点字数让节奏自然一点。<sup>R3</sup></p>
+    </section>
+    <section class="section">
+      <span class="num">03 · 还没跟自己说的一句</span>
+      <p>第三段 mock 占位。真实版这里会写 TA 整场对话里隐隐指向的东西。<sup>R5</sup></p>
+    </section>
+    <section class="section">
+      <span class="num">维度</span>
+      <div class="dim"><span class="dim-letter">I</span>
+        <div class="bar"><div class="bar-fill" style="width:72%"></div></div>
+        <span>0.72</span></div>
+      <div class="dim"><span class="dim-letter">N</span>
+        <div class="bar"><div class="bar-fill" style="width:65%"></div></div>
+        <span>0.65</span></div>
+      <div class="dim"><span class="dim-letter">T</span>
+        <div class="bar"><div class="bar-fill" style="width:60%"></div></div>
+        <span>0.60</span></div>
+      <div class="dim"><span class="dim-letter">J</span>
+        <div class="bar"><div class="bar-fill" style="width:58%"></div></div>
+        <span>0.58</span></div>
+    </section>
+    <section class="section">
+      <span class="num">你的原话</span>
+      <blockquote><span>R1</span>占位原话一</blockquote>
+    </section>
+    <p class="foot">你不用今天就懂自己。</p>
+  </main>
+</body>
+</html>
+"""
+
+
 class MockBackend(LLMBackend):
-    """确定性脚本 mock · v2.4 · 文本流 + 收束 JSON。
+    """确定性脚本 mock · v2.5.2 · 文本流 + 收束 HTML。
 
     - `stream_text`：按轮数从 _MOCK_TURN_SCRIPTS 取一条文本，逐字 yield；
       末尾补一行 `STATUS: CONTINUE`。到第 8 轮改成 `STATUS: CONVERGE`。
-    - `complete_json`：返回一个占位 converge 结构，便于前后端联调。
+    - `complete_text`：返回一份自包含 mock HTML 文档。
     """
 
     provider_name = "mock"
@@ -237,164 +314,13 @@ class MockBackend(LLMBackend):
             yield ch
 
     # ---- 报告轮 ----
-    async def complete_json(
+    async def complete_text(
         self,
         messages: List[Message],
         *,
-        response_schema: Optional[dict] = None,
-        timeout: float = 120.0,
-    ) -> dict:
-        user_msgs = [m.content for m in messages if m.role == "user"]
-        pulls = []
-        rounds_cited = []
-        for i, msg in enumerate(user_msgs[:3], start=1):
-            pulls.append({"text": (msg[:30] or "占位").strip(), "round": i})
-            rounds_cited.append(i)
-        if not rounds_cited:
-            rounds_cited = [1]
-            pulls = [{"text": "占位原话", "round": 1}]
-
-        insight = [
-            {
-                "theme": "看起来的你",
-                "body": (
-                    "这是 mock 生成的第一段洞见占位文本。正式版由 LLM 按 CONVERGE.md 指导生成。"
-                    "至少要 60 字的正文才能通过长度检查，所以这里再多铺一些字数凑一下长度 ok 这样差不多。"
-                ),
-                "quoted_rounds": rounds_cited[:1],
-            },
-            {
-                "theme": "一个小矛盾",
-                "body": (
-                    "第二段 mock 占位文本。真实版这里会写 TA 的矛盾或反差。"
-                    "再补点字数达到最低 60 字阈值，保证 JSON schema 通过。"
-                ),
-                "quoted_rounds": rounds_cited[:2],
-            },
-            {
-                "theme": "一句还没跟自己说的话",
-                "body": (
-                    "第三段 mock 占位文本。真实版这里会写 TA 整场对话里隐隐指向但自己没说出的东西。"
-                    "再加几个字把长度撑起来方便通过校验这样就够用了可以了。"
-                ),
-                "quoted_rounds": rounds_cited[-1:],
-            },
-        ]
-
-        quotes_html = "".join(
-            f"<blockquote><span>R{q['round']}</span>{q['text']}</blockquote>"
-            for q in pulls
-        )
-        para_bodies = "".join(
-            f"<section class=\"section\"><span class=\"num\">0{i+1}</span>"
-            f"<h2>{p['theme']}</h2><p>{p['body']}</p></section>"
-            for i, p in enumerate(insight)
-        )
-        html = (
-            "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
-            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-            "<title>mock · INTJ</title><style>"
-            "body{background:#08080f;color:#c8cdd8;margin:0;"
-            "font-family:'Noto Serif SC',-apple-system,sans-serif;}"
-            "main{max-width:720px;margin:auto;padding:40px;}"
-            "h1{font-size:3rem;font-weight:800;letter-spacing:-0.03em;}"
-            ".mbti{font-size:5rem;font-weight:800;color:#818cf8;"
-            "font-family:'JetBrains Mono',ui-monospace,monospace;}"
-            ".section{padding:32px;background:rgba(15,15,25,0.6);"
-            "border:1px solid rgba(255,255,255,0.06);margin:20px 0;border-radius:16px;}"
-            ".num{font-size:0.7rem;letter-spacing:0.12em;color:#5a5e72;}"
-            "blockquote{background:rgba(129,140,248,0.06);border-left:2px solid #818cf8;"
-            "padding:12px 16px;margin:10px 0;border-radius:8px;}"
-            "blockquote span{display:inline-block;color:#c084fc;margin-right:12px;}"
-            "</style></head><body><main>"
-            "<section><div class=\"mbti\">INTJ</div>"
-            "<h1>一个安静的 INTJ</h1>"
-            "<p style=\"color:#c084fc;\">mock · 演示用名片</p></section>"
-            + para_bodies
-            + "<section class=\"section\"><span class=\"num\">你的原话</span>"
-            + quotes_html
-            + "</section></main></body></html>"
-        )
-
-        return {
-            "mbti_type": "INTJ",
-            "confidence_per_dim": {
-                "E/I": {"letter": "I", "score": 0.72},
-                "S/N": {"letter": "N", "score": 0.65},
-                "T/F": {"letter": "T", "score": 0.60},
-                "J/P": {"letter": "J", "score": 0.58},
-            },
-            "insight_paragraphs": insight,
-            "card": {
-                "title": "一个安静的 INTJ",
-                "mbti_type": "INTJ",
-                "subtitle": "mock · 演示用名片",
-                "pull_quotes": pulls,
-                "typography_hint": "editorial_serif",
-            },
-            "report_html": html,
-        }
-
-
-# ---------------------------------------------------------------------------
-# JSON 容错解析（仅 complete_json 用）
-# ---------------------------------------------------------------------------
-
-
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
-_HTML_FIELD_START = re.compile(r'"report_html"\s*:\s*"', re.DOTALL)
-
-
-def _repair_html_json_field(raw: str) -> str:
-    """修复 report_html 字段里未转义的字符（LLM 常漏）。"""
-    m = _HTML_FIELD_START.search(raw)
-    if not m:
-        return raw
-    prefix = raw[: m.end()]
-    rest = raw[m.end():]
-    html_end_marker = rest.rfind("</html>")
-    if html_end_marker == -1:
-        html_end_marker = rest.rfind("</HTML>")
-    if html_end_marker == -1:
-        return raw
-    scan_from = html_end_marker + len("</html>")
-    close_quote_pos = rest.find('"', scan_from)
-    if close_quote_pos == -1:
-        close_quote_pos = scan_from
-    html_raw = rest[:close_quote_pos]
-    suffix = rest[close_quote_pos:]
-    html_escaped = (
-        html_raw
-        .replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t")
-    )
-    return prefix + html_escaped + suffix
-
-
-def _parse_json_safe(content: str) -> dict:
-    content = content.strip()
-    if not content:
-        raise ValueError("empty LLM content")
-    m = _JSON_FENCE_RE.search(content)
-    if m:
-        content = m.group(1)
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        pass
-    try:
-        return json.loads(content, strict=False)
-    except json.JSONDecodeError:
-        pass
-    try:
-        repaired = _repair_html_json_field(content)
-        return json.loads(repaired, strict=False)
-    except (json.JSONDecodeError, Exception):
-        pass
-    raise ValueError(f"LLM did not return valid JSON: {content[:200]!r}")
+        timeout: float = 300.0,
+    ) -> str:
+        return _MOCK_CONVERGE_HTML
 
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@ FastAPI routes · 对话（信件）管理 · v2.4。
 对外品牌统一用 "letter"；内部 DB / 代码层沿用 "session"。
 
 SSE 事件：
+- `event: quill`  · data `{"lines": ["Oriself ..."]}`  · token 前一次，0..2 条批注
 - `event: token`  · data `{"delta": "..."}`           · 一个或多个字符
 - `event: done`   · data `{"round": N, "status": "...", "visible": "..."}`
 - `event: error`  · data `{"message": "..."}`
@@ -46,7 +47,7 @@ from ..skill_runner import (
     TurnRunner,
     _parse_preferences_heuristic,
 )
-from ..utils.html_sanitize import escape_user_quote, sanitize_report_html
+from ..utils.html_sanitize import sanitize_report_html
 
 
 router = APIRouter(prefix="/letters", tags=["letters"])
@@ -94,6 +95,8 @@ class TranscriptTurn(BaseModel):
     speaker: str  # "you" | "oriself"
     text: str
     round: int
+    # v2.5.3 · 仅当 speaker == "oriself" 时可能非空；用户气泡不挂 quill。
+    quill_lines: Optional[List[str]] = None
 
 
 class TranscriptResponse(BaseModel):
@@ -104,10 +107,15 @@ class TranscriptResponse(BaseModel):
 
 
 class ResultResponse(BaseModel):
+    """v2.5.2 · 极简。
+
+    converge 不再输出结构化 insight_paragraphs / card；整份报告就是一份
+    自包含的 HTML（在 issue_slug 路由下由 iframe 渲染）。前端仅需
+    mbti_type 和 card_title 用于「最近信件」列表显示。
+    """
     letter_id: str
     mbti_type: str
-    insight_paragraphs: list
-    card: dict
+    card_title: Optional[str] = None
     issue_slug: Optional[str] = None
 
 
@@ -137,6 +145,14 @@ def _load_session_state(db: Session, session_id: str) -> SessionState:
     )
     turns: List[Turn] = []
     for c in convs:
+        q_lines: List[str] = []
+        if c.quill_json:
+            try:
+                parsed = json.loads(c.quill_json)
+                if isinstance(parsed, list):
+                    q_lines = [str(x) for x in parsed if isinstance(x, str)]
+            except Exception:
+                q_lines = []
         turns.append(
             Turn(
                 round_number=c.round_number,
@@ -144,6 +160,7 @@ def _load_session_state(db: Session, session_id: str) -> SessionState:
                 oriself_text=c.oriself_text or "",
                 status=c.status_sentinel or "CONTINUE",
                 discarded=bool(c.discarded),
+                quill_lines=q_lines,
             )
         )
     prefs = None
@@ -191,6 +208,7 @@ def _persist_turn(
     raw_stream: str,
     visible_text: str,
     status: str,
+    quill_lines: Optional[List[str]] = None,
 ) -> int:
     """把一轮对话写入 DB；顺便更新 session 状态。返回 round_number。"""
     state = _load_session_state(db, sess.session_id)
@@ -212,6 +230,11 @@ def _persist_turn(
             detail=f"round {round_number} already exists",
         )
 
+    quill_blob = (
+        json.dumps(quill_lines, ensure_ascii=False)
+        if quill_lines
+        else None
+    )
     conv = Conversation(
         session_id=sess.session_id,
         round_number=round_number,
@@ -220,6 +243,7 @@ def _persist_turn(
         raw_stream=raw_stream,
         status_sentinel=status,
         discarded=False,
+        quill_json=quill_blob,
     )
     db.add(conv)
 
@@ -263,6 +287,7 @@ async def _stream_turn_core(
     visible = ""
     status = "CONTINUE"
     had_error = False
+    quill_lines: List[str] = []
 
     try:
         async for kind, payload in runner.stream_turn(
@@ -274,6 +299,10 @@ async def _stream_turn_core(
                 # 前端也可以做末行剥除）。这里按 gstack 流式规范：先传原文，最后
                 # 在 `done` 事件里给最终 visible_text，前端用 visible_text 覆盖。
                 yield _sse("token", {"delta": payload})
+            elif kind == "quill":
+                if isinstance(payload, list) and payload:
+                    quill_lines = [str(x) for x in payload if isinstance(x, str)]
+                    yield _sse("quill", {"lines": quill_lines})
             elif kind == "error":
                 had_error = True
                 yield _sse("error", {"message": payload})
@@ -311,7 +340,9 @@ async def _stream_turn_core(
         status = "CONTINUE"
 
     try:
-        round_number = _persist_turn(db, sess, user_message, raw_accum, visible, status)
+        round_number = _persist_turn(
+            db, sess, user_message, raw_accum, visible, status, quill_lines
+        )
     except HTTPException as he:
         yield _sse("error", {"message": he.detail, "status_code": he.status_code})
         return
@@ -455,7 +486,22 @@ def get_transcript(letter_id: str, db: Session = Depends(get_db)):
         if c.user_message:
             turns.append(TranscriptTurn(speaker="you", text=c.user_message, round=c.round_number))
         if c.oriself_text:
-            turns.append(TranscriptTurn(speaker="oriself", text=c.oriself_text, round=c.round_number))
+            q_lines: Optional[List[str]] = None
+            if c.quill_json:
+                try:
+                    parsed = json.loads(c.quill_json)
+                    if isinstance(parsed, list):
+                        q_lines = [str(x) for x in parsed if isinstance(x, str)] or None
+                except Exception:
+                    q_lines = None
+            turns.append(
+                TranscriptTurn(
+                    speaker="oriself",
+                    text=c.oriself_text,
+                    round=c.round_number,
+                    quill_lines=q_lines,
+                )
+            )
 
     issue_slug: Optional[str] = None
     tr = db.query(TestResult).filter(TestResult.session_id == letter_id).first()
@@ -487,8 +533,7 @@ async def compose_result(letter_id: str, db: Session = Depends(get_db)):
         return ResultResponse(
             letter_id=letter_id,
             mbti_type=existing.mbti_type,
-            insight_paragraphs=json.loads(existing.insight_json),
-            card=json.loads(existing.card_json),
+            card_title=existing.issue_title,
             issue_slug=existing.issue_slug,
         )
 
@@ -530,24 +575,19 @@ async def compose_result(letter_id: str, db: Session = Depends(get_db)):
     if slug is None:
         slug = _generate_issue_slug(co.mbti_type)
 
-    # 清洗 pull_quotes + HTML
-    card_json = co.card.model_dump()
-    for pq in card_json.get("pull_quotes", []):
-        pq["text"] = escape_user_quote(pq.get("text", ""))
     safe_html = sanitize_report_html(co.report_html)
-
-    insight_list = [p.model_dump() for p in co.insight_paragraphs]
-    confidence = {dim: r.model_dump() for dim, r in co.confidence_per_dim.items()}
+    title = co.card_title or co.mbti_type  # 兜底：抽不到 <title> 就用 MBTI 字母
 
     db.add(
         TestResult(
             session_id=letter_id,
             mbti_type=co.mbti_type,
-            insight_json=json.dumps(insight_list, ensure_ascii=False),
-            card_json=json.dumps(card_json, ensure_ascii=False),
-            confidence_json=json.dumps(confidence, ensure_ascii=False),
+            # v2.5.2 起不再存 insight/card/confidence 结构化字段；保留列但写 null。
+            insight_json=None,
+            card_json=None,
+            confidence_json=None,
             issue_slug=slug,
-            issue_title=co.card.title,
+            issue_title=title,
             issue_html=safe_html,
             issue_is_public=True,
             issue_generated_at=datetime.now(timezone.utc),
@@ -559,7 +599,6 @@ async def compose_result(letter_id: str, db: Session = Depends(get_db)):
     return ResultResponse(
         letter_id=letter_id,
         mbti_type=co.mbti_type,
-        insight_paragraphs=insight_list,
-        card=card_json,
+        card_title=title,
         issue_slug=slug,
     )
