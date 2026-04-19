@@ -296,7 +296,7 @@ export function LetterView({
 
       <AuthorModal open={authorOpen} onClose={() => setAuthorOpen(false)} />
 
-      <main className="relative z-10 max-w-[620px] mx-auto px-8 pt-[140px] pb-[260px]">
+      <main className="relative z-10 max-w-[620px] mx-auto px-6 sm:px-8 pt-[90px] sm:pt-[140px] pb-[170px] sm:pb-[260px]">
         {turns.length === 0 && (
           <div className="mb-14">
             <span
@@ -356,9 +356,9 @@ export function LetterView({
                     onClick={handleRewrite}
                     className="font-mono text-[10px] tracking-widest uppercase text-ink-muted hover:text-accent transition-colors duration-300 bg-transparent border-0 cursor-pointer p-0"
                     disabled={isStreaming}
-                    aria-label="让 OriSelf 重写这一轮"
+                    aria-label="让 Oriself 重写这一轮"
                   >
-                    让 TA 重写 <span className="not-italic">↻</span>
+                    让 Oriself 重写 <span className="not-italic">↻</span>
                   </button>
                 </div>
               )}

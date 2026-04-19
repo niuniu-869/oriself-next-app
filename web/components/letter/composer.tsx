@@ -125,13 +125,19 @@ export function Composer({ onSend, disabled, draftKey, prefill }: Props) {
   }, [text, draftKey]);
 
   const handleSend = useCallback(() => {
-    const trimmed = text.trim();
+    // 兜底：如果外部用代码（测试 / 浏览器扩展 / 输入法）把 textarea.value 写进来
+    // 但没触发 React 的 onChange，就退而用 DOM 的 value，避免按钮判断空的错觉。
+    const raw = text || taRef.current?.value || "";
+    const trimmed = raw.trim();
     if (!trimmed || disabled) return;
     onSend(trimmed);
     setText("");
     if (draftKey) writeDraft(draftKey, "");
     requestAnimationFrame(() => {
-      if (taRef.current) taRef.current.style.height = "auto";
+      if (taRef.current) {
+        taRef.current.style.height = "auto";
+        taRef.current.value = "";
+      }
     });
   }, [text, disabled, onSend, draftKey]);
 
@@ -168,10 +174,11 @@ export function Composer({ onSend, disabled, draftKey, prefill }: Props) {
       // main 的 pb-[260px] padding 区域会堆在 composer 上面抢走点击
       // （composer 自己 pointer-events-none，但内层 textarea 的 pointer-events-auto
       // 区域需要比 main 高才能稳定接收点击）。
-      className="fixed left-0 right-0 bottom-0 z-20 px-8 pt-20 pb-9 pointer-events-none"
+      // 移动端把 pt 砍半、渐变收紧，避免最新一段答复被吞进雾里。
+      className="fixed left-0 right-0 bottom-0 z-20 px-6 sm:px-8 pt-10 sm:pt-20 pb-[max(16px,env(safe-area-inset-bottom))] sm:pb-9 pointer-events-none"
       style={{
         background:
-          "linear-gradient(to top, var(--paper) 55%, rgba(245, 240, 230, 0.92) 80%, rgba(245, 240, 230, 0))",
+          "linear-gradient(to top, var(--paper) 70%, rgba(245, 240, 230, 0.92) 88%, rgba(245, 240, 230, 0))",
       }}
     >
       <div className="max-w-[620px] mx-auto pointer-events-auto">
@@ -196,14 +203,22 @@ export function Composer({ onSend, disabled, draftKey, prefill }: Props) {
         />
 
         <div className="flex justify-between items-center mt-[14px] font-mono text-[10px] tracking-wide uppercase text-ink-muted">
-          <span aria-live="polite">
+          {/* 移动端没有 Ctrl / ESC，只保留「暂存」一行状态；桌面保留完整快捷键提示。 */}
+          <span aria-live="polite" className="hidden sm:inline">
             {savedHint
               ? "已暂存 · 下次回来还在"
               : `${isMac ? "⌘" : "Ctrl"} ↵ 发送 · ESC 暂存`}
           </span>
+          <span aria-live="polite" className="sm:hidden">
+            {savedHint ? "已暂存" : "轻点 → 发送"}
+          </span>
           <button
             onClick={handleSend}
-            disabled={disabled || !text.trim()}
+            // 同时看 React state + DOM value，两处有一处非空就允许点；避免 state
+            // 与 textarea.value 暂时不同步（例如外部 fill）导致按钮误 disabled。
+            disabled={
+              disabled || (!text.trim() && !(taRef.current?.value || "").trim())
+            }
             className="fraunces-body italic text-[15px] text-accent hover:text-accent-soft transition-colors duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] disabled:opacity-40 disabled:hover:text-accent bg-transparent border-0 cursor-pointer normal-case tracking-normal"
           >
             发 送 <span className="font-mono not-italic">→</span>

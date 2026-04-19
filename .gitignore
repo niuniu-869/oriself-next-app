@@ -41,3 +41,9 @@ Thumbs.db
 
 # Claude Code local metadata
 .claude/
+.gstack/
+.playwright-mcp/
+
+# Ops runtime (pm2 writes logs here via ops/ecosystem.config.cjs)
+logs/
+.pm2/

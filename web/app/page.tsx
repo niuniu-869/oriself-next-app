@@ -48,7 +48,7 @@ export default function LandingPage() {
       {/* Colophon — barely visible, edge of the page */}
       <footer className="px-6 sm:px-8 pb-16 sm:pb-8 pt-16">
         <div className="max-w-[1200px] mx-auto flex flex-wrap justify-between items-baseline gap-y-3 gap-x-6 font-mono text-[10px] tracking-widest uppercase text-ink-muted">
-          <span>OriSelf · Issue 04 · v2.4.0</span>
+          <span>OriSelf · Issue 04 · v2.5.2</span>
           <div className="flex items-baseline gap-[14px]">
             <a
               href="https://github.com/niuniu-869/oriself-next"

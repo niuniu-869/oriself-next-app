@@ -39,9 +39,8 @@ const notoSerifSC = Noto_Serif_SC({
 export const metadata: Metadata = {
   title: "OriSelf",
   description: "一份对话式人格画像 · 中文 · 2026",
-  icons: {
-    icon: "/favicon.ico",
-  },
+  // Favicon 走 app/icon.svg（Next 15 自动探测），不要在这里写死
+  // /favicon.ico 绝对路径 —— 之前 public/ 并不存在导致 404。
   openGraph: {
     title: "OriSelf",
     description: "一份对话式人格画像 · 中文 · 2026",

@@ -25,6 +25,35 @@ function baseUrl(): string {
   return "/api";
 }
 
+/**
+ * 把后端/上游 provider 的原始错误文本脱敏成一句"人话"。
+ *
+ * 原则：
+ *  - 不回显 provider 名（gemini / openai / qwen / kimi / deepseek / 302.ai 等）
+ *  - 不回显 JSON / HTTP 状态码以外的原始 payload
+ *  - 根据语义给一句 Oriself 口吻的友好提示
+ */
+export function friendlyError(raw: unknown): string {
+  const msg = raw instanceof Error ? raw.message : String(raw ?? "");
+  const low = msg.toLowerCase();
+  if (/overload|rate[_\s-]?limit|429|503|cpu overloaded|too many/.test(low)) {
+    return "Oriself 这会儿有点喘不过气，稍等一下再试一次。";
+  }
+  if (/timeout|timed out|504|gateway/.test(low)) {
+    return "这一段走得有点慢，像是网在喘气 —— 点一下再试。";
+  }
+  if (/401|403|unauthorized|forbidden|api[_\s-]?key/.test(low)) {
+    return "Oriself 现在联系不上它的笔，稍后再来。";
+  }
+  if (/5\d\d|internal server error|bad gateway/.test(low)) {
+    return "Oriself 走神了 —— 稍等一下，再点一次或「让 Oriself 重写」。";
+  }
+  if (/network|failed to fetch|econnreset|socket/.test(low)) {
+    return "网络断了一下，稍后重试。";
+  }
+  return "刚才那一笔没递出去 —— 稍等一下再试试。";
+}
+
 async function jsonFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const url = `${baseUrl()}${path}`;
   const res = await fetch(url, {
@@ -37,7 +66,13 @@ async function jsonFetch<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`${res.status} ${res.statusText}: ${text || path}`);
+    // 原文保留到一条给控制台的诊断日志里，用户看到的 Error 消息走脱敏。
+    if (typeof window !== "undefined" && typeof console !== "undefined") {
+      console.warn(
+        `[oriself api] ${res.status} ${res.statusText} @ ${path} :: ${(text || "").slice(0, 400)}`,
+      );
+    }
+    throw new Error(friendlyError(`${res.status} ${text}`));
   }
   return res.json() as Promise<T>;
 }
@@ -124,9 +159,12 @@ async function streamToDone(
 
   if (!res.ok || !res.body) {
     const text = await res.text().catch(() => "");
-    throw new Error(
-      `${res.status} ${res.statusText}: ${text || "stream not available"}`,
-    );
+    if (typeof window !== "undefined" && typeof console !== "undefined") {
+      console.warn(
+        `[oriself stream] ${res.status} ${res.statusText} :: ${(text || "").slice(0, 400)}`,
+      );
+    }
+    throw new Error(friendlyError(`${res.status} ${text}`));
   }
 
   const reader = res.body.getReader();
@@ -167,7 +205,11 @@ async function streamToDone(
       done = payload as TurnDonePayload;
     } else if (evtName === "error") {
       const p = payload as { message?: string };
-      errorMsg = p?.message ?? "stream error";
+      const raw = p?.message ?? "stream error";
+      if (typeof window !== "undefined" && typeof console !== "undefined") {
+        console.warn(`[oriself stream] error frame :: ${raw}`);
+      }
+      errorMsg = friendlyError(raw);
       opts.onError?.(errorMsg);
     }
   };
@@ -186,7 +228,7 @@ async function streamToDone(
   if (buffer.trim()) handleFrame(buffer);
 
   if (errorMsg) throw new Error(errorMsg);
-  if (!done) throw new Error("stream ended without done event");
+  if (!done) throw new Error(friendlyError("stream ended without done event"));
   return done;
 }
 

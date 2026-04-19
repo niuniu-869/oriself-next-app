@@ -43,7 +43,7 @@ class TestSession(Base):
     )
     provider = Column(String(20), nullable=False)
     domain = Column(String(20), nullable=False, default="mbti")
-    skill_version = Column(String(16), nullable=False, default="2.4.0")
+    skill_version = Column(String(16), nullable=False, default="2.5.2")
     status = Column(String(20), default="active")  # active | completed | failed
     # v2.4 · 收敛 prompt 需要的偏好信息；R2 服务端解析后写入
     prefs_json = Column(Text)

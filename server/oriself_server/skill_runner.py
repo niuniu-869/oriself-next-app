@@ -296,8 +296,10 @@ class TurnRunner:
                 buffer += chunk
                 yield ("token", chunk)
         except Exception as exc:
+            # 原文进 server 日志用于排查；只把一个脱敏 code 送到前端，避免把
+            # provider 名 / 原 JSON 糊到用户正在看的对话流里。
             logger.warning("stream_turn backend error: %s", exc)
-            yield ("error", f"后端流错误：{exc}")
+            yield ("error", "UPSTREAM_LLM_STREAM_FAILED")
             return
 
         parsed = parse_status_sentinel(buffer)

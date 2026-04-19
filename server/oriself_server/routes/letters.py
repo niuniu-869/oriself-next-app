@@ -316,8 +316,9 @@ async def _stream_turn_core(
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001
-        logger.exception("stream core error")
-        yield _sse("error", {"message": f"stream error: {exc}"})
+        # exception 原文只进 server 日志，不返回前端；避免把 provider 栈信息泄漏
+        logger.exception("stream core error: %s", exc)
+        yield _sse("error", {"message": "INTERNAL_STREAM_ERROR"})
         return
 
     if had_error:
@@ -347,8 +348,8 @@ async def _stream_turn_core(
         yield _sse("error", {"message": he.detail, "status_code": he.status_code})
         return
     except Exception as exc:  # noqa: BLE001
-        logger.exception("persist error")
-        yield _sse("error", {"message": f"persist error: {exc}"})
+        logger.exception("persist error: %s", exc)
+        yield _sse("error", {"message": "INTERNAL_PERSIST_ERROR"})
         return
 
     yield _sse("done", {
@@ -523,82 +524,110 @@ def get_transcript(letter_id: str, db: Session = Depends(get_db)):
 
 @router.post("/{letter_id}/result", response_model=ResultResponse)
 async def compose_result(letter_id: str, db: Session = Depends(get_db)):
-    """触发报告生成。已生成则直接返回；没有则 LLM 跑一次 CONVERGE.md（最多 3 次 retry）。"""
-    sess = db.get(TestSession, letter_id)
-    if sess is None:
-        raise HTTPException(status_code=404, detail="letter not found")
+    """触发报告生成。已生成则直接返回；没有则 LLM 跑一次 CONVERGE.md（最多 3 次 retry）。
 
-    existing = db.query(TestResult).filter(TestResult.session_id == letter_id).first()
-    if existing is not None:
+    错误契约（v2.5.2 加固）：
+      - 404 letter 不存在
+      - 409 轮数不够（<MIN_CONVERGE_ROUND） —— 语义更准，之前是 400
+      - 502 上游 LLM compose 失败（结构化 `{message, reasons}`）
+      - 500 兜底 —— 任何未预期 exception 都走 structured JSON，而不是 FastAPI
+            的裸 "Internal Server Error" 文本（那条现在会泄漏 provider 名）
+    """
+    try:
+        sess = db.get(TestSession, letter_id)
+        if sess is None:
+            raise HTTPException(status_code=404, detail="letter not found")
+
+        existing = (
+            db.query(TestResult).filter(TestResult.session_id == letter_id).first()
+        )
+        if existing is not None:
+            return ResultResponse(
+                letter_id=letter_id,
+                mbti_type=existing.mbti_type,
+                card_title=existing.issue_title,
+                issue_slug=existing.issue_slug,
+            )
+
+        state = _load_session_state(db, letter_id)
+        if state.round_count < MIN_CONVERGE_ROUND:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"对话只有 {state.round_count} 轮，至少 "
+                    f"{MIN_CONVERGE_ROUND} 轮才能写报告"
+                ),
+            )
+
+        bundle = load_skill_bundle()
+        backend = make_backend(sess.provider)
+        runner = ReportRunner(backend=backend, bundle=bundle)
+
+        result = await runner.compose(state)
+        if result.output is None:
+            sess.status = "failed"
+            db.commit()
+            logger.warning(
+                "compose_result: runner returned no output; reasons=%s",
+                result.error_reasons[:3],
+            )
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "报告生成失败，请稍后重试",
+                    "reasons": result.error_reasons[:3],
+                },
+            )
+
+        co = result.output
+
+        # 生成唯一 slug
+        slug = None
+        for _ in range(3):
+            candidate = _generate_issue_slug(co.mbti_type)
+            if not (
+                db.query(TestResult)
+                .filter(TestResult.issue_slug == candidate)
+                .first()
+            ):
+                slug = candidate
+                break
+        if slug is None:
+            slug = _generate_issue_slug(co.mbti_type)
+
+        safe_html = sanitize_report_html(co.report_html)
+        title = co.card_title or co.mbti_type  # 兜底：抽不到 <title> 就用 MBTI 字母
+
+        db.add(
+            TestResult(
+                session_id=letter_id,
+                mbti_type=co.mbti_type,
+                # v2.5.2 起不再存 insight/card/confidence 结构化字段；保留列但写 null。
+                insight_json=None,
+                card_json=None,
+                confidence_json=None,
+                issue_slug=slug,
+                issue_title=title,
+                issue_html=safe_html,
+                issue_is_public=True,
+                issue_generated_at=datetime.now(timezone.utc),
+            )
+        )
+        sess.status = "completed"
+        db.commit()
+
         return ResultResponse(
             letter_id=letter_id,
-            mbti_type=existing.mbti_type,
-            card_title=existing.issue_title,
-            issue_slug=existing.issue_slug,
+            mbti_type=co.mbti_type,
+            card_title=title,
+            issue_slug=slug,
         )
-
-    state = _load_session_state(db, letter_id)
-    if state.round_count < MIN_CONVERGE_ROUND:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"对话只有 {state.round_count} 轮，至少 "
-                f"{MIN_CONVERGE_ROUND} 轮才能写报告"
-            ),
-        )
-
-    bundle = load_skill_bundle()
-    backend = make_backend(sess.provider)
-    runner = ReportRunner(backend=backend, bundle=bundle)
-
-    result = await runner.compose(state)
-    if result.output is None:
-        sess.status = "failed"
-        db.commit()
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # 兜底：把未分类 exception 转成 structured 502，原文只进 server 日志
+        logger.exception("compose_result unhandled error: %s", exc)
         raise HTTPException(
             status_code=502,
-            detail={
-                "message": "报告生成失败，请稍后重试",
-                "reasons": result.error_reasons[:3],
-            },
+            detail={"message": "报告生成卡住了，请稍后重试", "reasons": []},
         )
-
-    co = result.output
-
-    # 生成唯一 slug
-    slug = None
-    for _ in range(3):
-        candidate = _generate_issue_slug(co.mbti_type)
-        if not db.query(TestResult).filter(TestResult.issue_slug == candidate).first():
-            slug = candidate
-            break
-    if slug is None:
-        slug = _generate_issue_slug(co.mbti_type)
-
-    safe_html = sanitize_report_html(co.report_html)
-    title = co.card_title or co.mbti_type  # 兜底：抽不到 <title> 就用 MBTI 字母
-
-    db.add(
-        TestResult(
-            session_id=letter_id,
-            mbti_type=co.mbti_type,
-            # v2.5.2 起不再存 insight/card/confidence 结构化字段；保留列但写 null。
-            insight_json=None,
-            card_json=None,
-            confidence_json=None,
-            issue_slug=slug,
-            issue_title=title,
-            issue_html=safe_html,
-            issue_is_public=True,
-            issue_generated_at=datetime.now(timezone.utc),
-        )
-    )
-    sess.status = "completed"
-    db.commit()
-
-    return ResultResponse(
-        letter_id=letter_id,
-        mbti_type=co.mbti_type,
-        card_title=title,
-        issue_slug=slug,
-    )
