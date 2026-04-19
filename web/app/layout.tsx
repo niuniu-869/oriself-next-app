@@ -6,6 +6,7 @@ import {
   Noto_Serif_SC,
 } from "next/font/google";
 import { CustomCursor } from "@/components/primitives/custom-cursor";
+import { AuthorBadge } from "@/components/primitives/author-badge";
 import "./globals.css";
 
 const fraunces = Fraunces({
@@ -60,6 +61,7 @@ export default function RootLayout({
     >
       <body>
         {children}
+        <AuthorBadge />
         <CustomCursor />
       </body>
     </html>

@@ -65,6 +65,29 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
 
+    # v2.5.3 · in-place 兼容迁移：为旧库的 conversations 补上 quill_json 列。
+    # create_all 不会为已存在的表新增列，所以这里显式 ALTER。SQLite 走 PRAGMA；
+    # PostgreSQL 走 ADD COLUMN IF NOT EXISTS。失败不阻断启动——列缺失时回落到
+    # `quill_json IS NULL` 的默认路径，仅会让旧 letter 看不到 quill 行。
+    try:
+        url = str(engine.url)
+        with engine.begin() as conn:
+            if url.startswith("sqlite"):
+                cols = conn.exec_driver_sql(
+                    "PRAGMA table_info(conversations)"
+                ).fetchall()
+                existing = {row[1] for row in cols}  # row[1] = column name
+                if "quill_json" not in existing:
+                    conn.exec_driver_sql(
+                        "ALTER TABLE conversations ADD COLUMN quill_json TEXT"
+                    )
+            else:
+                conn.exec_driver_sql(
+                    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS quill_json TEXT"
+                )
+    except Exception:
+        pass
+
 
 @contextmanager
 def session_scope() -> Iterator[Session]:

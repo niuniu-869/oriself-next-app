@@ -67,6 +67,8 @@ export async function getLetterTranscript(
 export interface TurnStreamOptions {
   onToken?: (delta: string) => void;
   onError?: (message: string) => void;
+  /** token 流之前一次性给出的铅笔批注（0..2 条）。 */
+  onQuill?: (lines: string[]) => void;
   signal?: AbortSignal;
 }
 
@@ -74,6 +76,7 @@ export interface TurnStreamOptions {
  * 流式对话 · SSE token 透传 + 结束时给 DonePayload。
  *
  * 事件：
+ *  - event: quill   { lines: string[] }      // token 之前，可选
  *  - event: token   { delta: string }
  *  - event: done    { round, status, visible }
  *  - event: error   { message }
@@ -154,6 +157,12 @@ async function streamToDone(
     if (evtName === "token") {
       const delta = (payload as { delta?: string })?.delta ?? "";
       if (delta) opts.onToken?.(delta);
+    } else if (evtName === "quill") {
+      const lines = (payload as { lines?: unknown })?.lines;
+      if (Array.isArray(lines)) {
+        const safe = lines.filter((x): x is string => typeof x === "string");
+        if (safe.length > 0) opts.onQuill?.(safe);
+      }
     } else if (evtName === "done") {
       done = payload as TurnDonePayload;
     } else if (evtName === "error") {

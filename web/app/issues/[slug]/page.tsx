@@ -1,7 +1,9 @@
+import { Suspense } from "react";
 import { notFound } from "next/navigation";
 import { getIssue } from "@/lib/api";
 import { IssueChrome } from "@/components/issue/issue-chrome";
 import { HistorySync } from "@/components/history/history-sync";
+import { ArrivalCeremony } from "@/components/issue/arrival-ceremony";
 
 /**
  * /issues/:slug · the report page.
@@ -60,6 +62,11 @@ export default async function IssuePage({
           cardTitle={meta.title}
         />
       )}
+
+      {/* 封缄时刻 · 仅在 ?arrived=1 首次到达时出现 */}
+      <Suspense fallback={null}>
+        <ArrivalCeremony slug={meta.slug} />
+      </Suspense>
 
       {/* Hidden heading for accessibility / crawlers */}
       <h1 className="sr-only">{meta.title} · OriSelf Issue</h1>

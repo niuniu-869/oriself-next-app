@@ -1,5 +1,5 @@
 """
-OriSelfGuardrails · v2.4 精简版。
+OriSelfGuardrails · v2.5.2。
 
 哲学转向：
 - v2.0-2.3 我们用 50+ 条规则拒 LLM 输出。实操发现 R1 第一句就可能全部
@@ -7,8 +7,12 @@ OriSelfGuardrails · v2.4 精简版。
 - v2.4 只保留**会让系统真的坏掉**的硬拦截：
     1. 对话轮数 ≤ MAX_ROUNDS（算力预算）
     2. report_html 无 XSS 向量（安全边界）
-    3. report_html 里 4 字母 MBTI 串 == 派生 mbti_type（单一真相源一致性）
-- 对话轮的"品味"约束（治疗师腔 / 模板词 / 反射引原话等）全部迁至 SKILL.md + phase
+    3. report_html 里 4 字母 MBTI 串唯一（单一真相源）
+- v2.5.2 converge 不再走 JSON：LLM 直吐 HTML。本文件新增：
+    · verify_report_html_parseable（HTML 语法完整性）
+    · extract_mbti_from_html（从可见文本抽 4 字母 token，去重保序）
+    · extract_card_title_from_html（抽 <title> 作 card 标题）
+- 对话轮的"品味"约束（治疗师腔 / 模板词 / 反射引原话等）全部在 SKILL.md + phase
   文件的散文指令。LLM 偶尔没做好 → 用户点「重写这轮」，不在服务端 retry。
 - 报告生成（converge）允许 3 次 retry，这里定义守护规则。
 """
@@ -16,7 +20,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional
+from html.parser import HTMLParser
+from typing import List, Optional, Tuple
 
 from .schemas import MAX_ROUNDS
 
@@ -86,6 +91,12 @@ def verify_report_html_shape(html: str) -> GuardrailResult:
     if not html:
         return GuardrailResult.fail("report_html is empty")
     reasons: List[str] = []
+    # 骨架检查：doctype + html 标签
+    low = html.lower()
+    if "<!doctype" not in low:
+        reasons.append("report_html 缺少 <!DOCTYPE html> 开头")
+    if "<html" not in low or "</html>" not in low:
+        reasons.append("report_html 缺少完整 <html>...</html> 标签")
     if _RE_SCRIPT.search(html):
         reasons.append("report_html 含 <script>（禁止 JS 执行）")
     if _RE_IFRAME.search(html):
@@ -103,18 +114,195 @@ def verify_report_html_shape(html: str) -> GuardrailResult:
     return GuardrailResult.ok() if not reasons else GuardrailResult.fail(*reasons)
 
 
+# ---------------------------------------------------------------------------
+# v2.5.2 · HTML 解析 + 信息抽取
+# ---------------------------------------------------------------------------
+
+
+class _TextCollector(HTMLParser):
+    """扫一遍 HTML，输出：
+
+    - `.text_parts`: 非 <style>/<script> 标签下的纯文本片段
+    - `.title`: <title> 内的文本（首次遇到）
+    - `.well_formed`: True 表示解析过程中没触发致命错误
+    """
+
+    # 不计入文本抽取的标签（内容不是"页面可见文本"）
+    _SKIP_TAGS = {"style", "script"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.text_parts: List[str] = []
+        self.title: Optional[str] = None
+        self._in_title: bool = False
+        self._skip_stack: List[str] = []
+        self.well_formed: bool = True
+        self.error: Optional[str] = None
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[override]
+        tag_low = tag.lower()
+        if tag_low in self._SKIP_TAGS:
+            self._skip_stack.append(tag_low)
+        if tag_low == "title":
+            self._in_title = True
+
+    def handle_endtag(self, tag: str) -> None:  # type: ignore[override]
+        tag_low = tag.lower()
+        if self._skip_stack and self._skip_stack[-1] == tag_low:
+            self._skip_stack.pop()
+        if tag_low == "title":
+            self._in_title = False
+
+    def handle_data(self, data: str) -> None:  # type: ignore[override]
+        if self._in_title:
+            if self.title is None:
+                self.title = data.strip()
+            else:
+                # 标题里多段文本拼接
+                self.title = (self.title + data).strip()
+        if self._skip_stack:
+            return
+        if data:
+            self.text_parts.append(data)
+
+    def error(self, message: str) -> None:  # noqa: D401  (HTMLParser 历史 API)
+        self.well_formed = False
+        if self.error is None:
+            self.error = message
+
+
+def _parse_html(html: str) -> _TextCollector:
+    p = _TextCollector()
+    try:
+        p.feed(html)
+        p.close()
+    except Exception as exc:  # html.parser 在极脏 HTML 上极少抛；抛了就按不合格处理
+        p.well_formed = False
+        p.error = str(exc)
+    return p
+
+
+def verify_report_html_parseable(html: str) -> GuardrailResult:
+    """HTML 必须能被 Python 标准库 html.parser 完整扫完。
+
+    这是"能不能被浏览器渲染"的最低门槛代理。比 BeautifulSoup 更严格一点
+    （HTMLParser 对未闭合的诸如 `<foo attr=\"...` 会抛），比 html5lib 更宽松。
+    """
+    if not html or not html.strip():
+        return GuardrailResult.fail("HTML 为空")
+    p = _parse_html(html)
+    if not p.well_formed:
+        return GuardrailResult.fail(
+            f"HTML 解析失败：{p.error or '未知错误'}"
+        )
+    # 没解析出任何可见文本，视为坏 HTML（通常是 LLM 吐了一大段 markdown）
+    total_text = "".join(p.text_parts).strip()
+    if len(total_text) < 30:
+        return GuardrailResult.fail(
+            f"HTML 里可见文本过少（{len(total_text)} 字符），"
+            "疑似截断或仅输出了样式/脚本块"
+        )
+    return GuardrailResult.ok()
+
+
+def extract_card_title_from_html(html: str) -> Optional[str]:
+    """从 <title>…</title> 抽 card 标题；没抽到返回 None。"""
+    if not html:
+        return None
+    p = _parse_html(html)
+    if not p.title:
+        return None
+    title = p.title.strip()
+    return title or None
+
+
+def extract_mbti_from_html(html: str) -> List[str]:
+    """从 HTML 的"可见文本"（剔除 <style>/<script>）里扫 4 字母 MBTI token。
+
+    返回去重保序列表。调用方按下列策略决策：
+    - len() == 1 → 合格，这就是 mbti_type
+    - len() == 0 → 失败（LLM 忘了写 MBTI）
+    - len() > 1  → 失败（多种 MBTI 同时出现 = 一致性违反）
+    """
+    if not html:
+        return []
+    p = _parse_html(html)
+    # 用空白把相邻标签的文本分隔开，避免 `<h1>INTP</h1><p>context…` 这种被拼成
+    # `INTPcontext…` 导致 token 边界误判。
+    visible = " ".join(part for part in p.text_parts if part)
+    if p.title:
+        visible = p.title + " " + visible
+    tokens = _RE_MBTI_TOKEN.findall(visible)
+    # 去重保序
+    seen: List[str] = []
+    for t in tokens:
+        if t not in seen:
+            seen.append(t)
+    return seen
+
+
+def resolve_mbti_or_fail(html: str) -> Tuple[Optional[str], GuardrailResult]:
+    """把 extract_mbti_from_html 的三分支决策包装成 (mbti, result)。
+
+    成功：返回 (mbti_type, ok)
+    失败：返回 (None, fail_result)
+    """
+    tokens = extract_mbti_from_html(html)
+    if not tokens:
+        return None, GuardrailResult.fail(
+            "HTML 可见文本里找不到 4 字母 MBTI（如 'INTP'）。"
+            "请在显眼位置明确写出 TA 的 MBTI 类型。"
+        )
+    if len(tokens) > 1:
+        return None, GuardrailResult.fail(
+            f"HTML 里出现多种 MBTI 字母串 {tokens}；"
+            "必须只出现一种 —— 全文所有 4 字母位置都写成同一个类型。"
+        )
+    return tokens[0], GuardrailResult.ok()
+
+
 def verify_report_html_consistency(html: str, mbti_type: str) -> GuardrailResult:
-    """字母一致性 · HTML 里每一处 4 字母 MBTI 串都必须等于派生值。"""
+    """字母一致性 · HTML 里每一处 4 字母 MBTI 串都必须等于给定值。
+
+    v2.5.2 起主要用于**回归校验**：ReportRunner 已经通过 resolve_mbti_or_fail
+    把 mbti 从 HTML 抽出来，此函数给已有测试保留同名 API（HTML 中的四字母必须唯一
+    且匹配），语义上等价于 resolve_mbti_or_fail + 等值比较。
+    """
     if not html or not mbti_type:
         return GuardrailResult.ok()
-    found = set(_RE_MBTI_TOKEN.findall(html))
-    mismatched = [tok for tok in found if tok != mbti_type]
+    tokens = extract_mbti_from_html(html)
+    if not tokens:
+        return GuardrailResult.fail(
+            f"report_html 里没找到任何 4 字母 MBTI；期望 {mbti_type!r}"
+        )
+    mismatched = [t for t in tokens if t != mbti_type]
     if mismatched:
         return GuardrailResult.fail(
             f"report_html 里出现 {sorted(mismatched)} 与派生 mbti_type={mbti_type!r} 不一致；"
             f"请把 HTML 里所有 4 字母 MBTI 处都写成 {mbti_type!r}"
         )
     return GuardrailResult.ok()
+
+
+# ---------------------------------------------------------------------------
+# Markdown fence 剥离（LLM 有时顽固地包 ```html）
+# ---------------------------------------------------------------------------
+
+
+_FENCE_RE = re.compile(
+    r"^\s*```(?:html)?\s*\n?(.*?)\n?```[\s]*$",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def strip_markdown_fence(text: str) -> str:
+    """LLM 偶尔用 ```html ... ``` 包 HTML，剥掉。"""
+    if not text:
+        return text
+    m = _FENCE_RE.match(text.strip())
+    if m:
+        return m.group(1).strip()
+    return text
 
 
 # ---------------------------------------------------------------------------

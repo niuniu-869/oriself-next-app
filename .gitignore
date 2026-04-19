@@ -38,3 +38,6 @@ Thumbs.db
 # Deploy
 .vercel/
 .fly/
+
+# Claude Code local metadata
+.claude/

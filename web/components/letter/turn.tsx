@@ -1,7 +1,8 @@
-'use client';
+"use client";
 
-import { memo } from 'react';
-import type { TurnRecord } from '@/lib/types';
+import { memo } from "react";
+import type { TurnRecord } from "@/lib/types";
+import { QuillNote } from "./quill-note";
 
 interface Props {
   turn: TurnRecord;
@@ -12,24 +13,30 @@ interface Props {
 /**
  * 单条 turn。
  *
- * OriSelf · serif body，无气泡。
+ * OriSelf · serif body，无气泡；气泡顶部可能挂一条 QuillNote（Oriself 的笔触批注）。
  * You · 左侧 em-dash 点缀。
  * 无头像、无时间戳。
  *
  * v2.4 · 删除旧的 RevealText 分句动画 —— 真流式时文本每帧都在变，按标点分段的
  * 动画会反复重排很丑。现在只做两件事：`white-space: pre-wrap` 保留换行 +
  * streaming 时末尾挂一个 writing-cursor。
+ * v2.5.3 · Oriself 气泡上方增加 QuillNote：token 之前就渲染，流完不消失，回看也在。
  */
 export const Turn = memo(function Turn({ turn, streaming = false }: Props) {
-  if (turn.speaker === 'oriself') {
+  if (turn.speaker === "oriself") {
     return (
       <article className="mb-14 animate-settle">
+        {turn.quill_lines && turn.quill_lines.length > 0 && (
+          <QuillNote lines={turn.quill_lines} />
+        )}
         <p
           className="fraunces-body text-[20px] leading-[1.62] tracking-tight text-ink"
-          style={{ whiteSpace: 'pre-wrap' }}
+          style={{ whiteSpace: "pre-wrap" }}
         >
           {turn.text}
-          {streaming && <span className="writing-cursor inline-block align-baseline" />}
+          {streaming && (
+            <span className="writing-cursor inline-block align-baseline" />
+          )}
         </p>
       </article>
     );
@@ -40,13 +47,16 @@ export const Turn = memo(function Turn({ turn, streaming = false }: Props) {
       <span
         aria-hidden
         className="absolute left-0 top-[6px] font-serif text-[26px] leading-none text-accent"
-        style={{ fontVariationSettings: '"opsz" 36, "SOFT" 0, "WONK" 0', fontWeight: 300 }}
+        style={{
+          fontVariationSettings: '"opsz" 36, "SOFT" 0, "WONK" 0',
+          fontWeight: 300,
+        }}
       >
         —
       </span>
       <p
         className="fraunces-body-soft text-[19px] leading-[1.65] text-ink-soft"
-        style={{ whiteSpace: 'pre-wrap' }}
+        style={{ whiteSpace: "pre-wrap" }}
       >
         {turn.text}
       </p>

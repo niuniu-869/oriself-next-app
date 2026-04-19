@@ -79,6 +79,9 @@ class Conversation(Base):
     raw_stream = Column(Text)
     status_sentinel = Column(String(16), default="CONTINUE")
     discarded = Column(Boolean, default=False, nullable=False)
+    # v2.5.3 · 本轮展示给用户的 Oriself 笔触（JSON 数组：["Oriself 想多问一些", ...]）。
+    # 永久留在回看页上，和 oriself_text 一起构成这一轮的完整呈现。
+    quill_json = Column(Text, nullable=True)
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
@@ -107,9 +110,11 @@ class TestResult(Base):
         nullable=False,
     )
     mbti_type = Column(String(8), nullable=False)
-    insight_json = Column(Text, nullable=False)       # 3 段洞见序列化
-    card_json = Column(Text, nullable=False)          # 名片结构化数据
-    confidence_json = Column(Text)                    # confidence_per_dim 序列化
+    # v2.5.2 起 converge 不再产生结构化 insight/card/confidence（LLM 直吐 HTML）。
+    # 保留列以便读取旧数据；新写入时全为 NULL。
+    insight_json = Column(Text, nullable=True)        # 3 段洞见序列化（废弃）
+    card_json = Column(Text, nullable=True)           # 名片结构化数据（废弃）
+    confidence_json = Column(Text, nullable=True)     # confidence_per_dim 序列化（废弃）
 
     # Issue · 可分享报告（v2.2+）
     issue_slug = Column(String(32), unique=True, index=True)

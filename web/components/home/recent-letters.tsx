@@ -35,7 +35,7 @@ export function RecentLetters() {
   return (
     <section
       aria-label="你最近的信"
-      className="w-full max-w-[620px] mx-auto px-8 pb-20"
+      className="w-full max-w-[620px] mx-auto px-6 sm:px-8 pb-20"
     >
       <p className="font-mono text-[10px] tracking-widest uppercase text-ink-muted mb-6">
         最近在你的浏览器里 · 本地保存 · 未上传
@@ -63,7 +63,7 @@ function LetterRow({
   const targetLabel = isDone ? "看报告" : "回到这封信";
 
   return (
-    <li className="flex items-start justify-between gap-4 border-b border-rule pb-4">
+    <li className="flex items-start justify-between gap-3 sm:gap-4 border-b border-rule pb-4">
       <div className="min-w-0 flex-1">
         <Link
           href={targetHref}
@@ -98,7 +98,7 @@ function LetterRow({
         </Link>
       </div>
 
-      <div className="flex items-center gap-4 pt-[2px]">
+      <div className="flex items-center gap-3 sm:gap-4 pt-[2px]">
         <Link
           href={targetHref}
           className="fraunces-body italic text-[14px] text-accent hover:text-accent-soft border-b border-accent/40 hover:border-accent transition-colors whitespace-nowrap"
