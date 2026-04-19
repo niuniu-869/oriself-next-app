@@ -2,7 +2,7 @@
 
 [English](./README_EN.md)
 
-**可自部署的 OriSelf 完整实例。** 由 Next.js 前端 + FastAPI 后端组成，加载 [`niuniu-869/oriself-next`](https://github.com/niuniu-869/oriself-next) skill 作为产品本体。
+**可自部署的 OriSelf 完整实例。** 由 Next.js 前端 + FastAPI 后端组成，加载 [`Deep-Thinks/oriself-next`](https://github.com/Deep-Thinks/oriself-next) skill 作为产品本体。
 
 官方部署：[next.oriself.com](https://next.oriself.com)
 
@@ -14,7 +14,7 @@ OriSelf 的架构是分层的：
 
 | 层 | 做什么 | 在哪 |
 |---|---|---|
-| **Skill** | 访谈方法论 · 一组 markdown | [`niuniu-869/oriself-next`](https://github.com/niuniu-869/oriself-next) |
+| **Skill** | 访谈方法论 · 一组 markdown | [`Deep-Thinks/oriself-next`](https://github.com/Deep-Thinks/oriself-next) |
 | **Server** | FastAPI · 对话循环 + guardrails + LLM 适配 | 本仓库 `server/` |
 | **Web** | Next.js · 落地页 / 对话页 / 报告页 | 本仓库 `web/` |
 
@@ -25,7 +25,7 @@ OriSelf 的架构是分层的：
 ## 自部署（5 分钟）
 
 ```bash
-git clone --recurse-submodules https://github.com/niuniu-869/oriself-next-app.git
+git clone --recurse-submodules https://github.com/Deep-Thinks/oriself-next-app.git
 cd oriself-next-app
 cp .env.example .env
 # 编辑 .env，填入任一 LLM API key（DeepSeek / Qwen / Kimi / OpenAI）
@@ -55,7 +55,7 @@ docker compose up --build
                                    │
                           ┌────────────────────┐
                           │  skill-repo/       │  ← git submodule →
-                          │    skills/oriself/ │    niuniu-869/oriself-next
+                          │    skills/oriself/ │    Deep-Thinks/oriself-next
                           │    SKILL.md ...    │
                           └────────────────────┘
 ```
@@ -119,7 +119,7 @@ git commit -m "bump skill to v2.x.x"
 
 ```
 oriself-next-app/
-├── skill-repo/                    # git submodule → niuniu-869/oriself-next
+├── skill-repo/                    # git submodule → Deep-Thinks/oriself-next
 │   └── skills/oriself/            # ↑ 真正的 skill 在这
 │
 ├── web/                           # Next.js 15 · next.oriself.com
@@ -159,4 +159,4 @@ oriself-next-app/
 
 **Apache 2.0**。随你 fork、改造、自托管。
 
-Skill 本体在 [`niuniu-869/oriself-next`](https://github.com/niuniu-869/oriself-next) 有单独的许可证（也是 Apache 2.0）。
+Skill 本体在 [`Deep-Thinks/oriself-next`](https://github.com/Deep-Thinks/oriself-next) 有单独的许可证（也是 Apache 2.0）。

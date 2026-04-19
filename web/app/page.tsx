@@ -51,7 +51,7 @@ export default function LandingPage() {
           <span>OriSelf · Issue 04 · v2.5.2</span>
           <div className="flex items-baseline gap-[14px]">
             <a
-              href="https://github.com/niuniu-869/oriself-next"
+              href="https://github.com/Deep-Thinks/oriself-next"
               className="hover:text-accent transition-colors"
               target="_blank"
               rel="noopener"
@@ -63,7 +63,7 @@ export default function LandingPage() {
               ·
             </span>
             <a
-              href="https://github.com/niuniu-869/oriself-next-app"
+              href="https://github.com/Deep-Thinks/oriself-next-app"
               className="hover:text-accent transition-colors"
               target="_blank"
               rel="noopener"
