@@ -16,6 +16,9 @@ services:
       - ORISELF_DB_PATH=/data/oriself.db
       - ORISELF_SKILL_ROOT=/app/skill-repo/skills/oriself
       - ORISELF_CORS_ORIGINS=${ORISELF_CORS_ORIGINS:-*}
+      - ORISELF_GEMINI_API_KEY=${ORISELF_GEMINI_API_KEY:-}
+      - ORISELF_GEMINI_BASE_URL=${ORISELF_GEMINI_BASE_URL:-}
+      - ORISELF_GEMINI_MODEL=${ORISELF_GEMINI_MODEL:-}
       - ORISELF_DEEPSEEK_API_KEY=${ORISELF_DEEPSEEK_API_KEY:-}
       - ORISELF_QWEN_API_KEY=${ORISELF_QWEN_API_KEY:-}
       - ORISELF_KIMI_API_KEY=${ORISELF_KIMI_API_KEY:-}
@@ -35,7 +38,7 @@ services:
     build: ./web
     container_name: oriself-web
     ports:
-      - "3000:3000"
+      - "3002:3000"
     environment:
       - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
       - API_INTERNAL_URL=http://server:8000

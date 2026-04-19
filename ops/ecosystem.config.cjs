@@ -35,7 +35,7 @@ module.exports = {
     {
       name: "oriself-server",
       cwd: path.join(ROOT, "server"),
-      script: "python3",
+      script: path.join(ROOT, "server", ".venv", "bin", "python3"),
       args: [
         "-m",
         "uvicorn",

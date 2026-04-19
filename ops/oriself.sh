@@ -160,7 +160,7 @@ cmd_deploy() {
   echo "[deploy] git pull --ff-only"
   (cd "$ROOT" && git pull --ff-only)
   echo "[deploy] server : pip install -e ."
-  (cd "$ROOT/server" && pip install -e . >/dev/null)
+  (cd "$ROOT/server" && .venv/bin/pip install -e . >/dev/null)
   echo "[deploy] web    : pnpm install --frozen-lockfile && pnpm build"
   (cd "$ROOT/web" && pnpm install --frozen-lockfile && pnpm build)
   echo "[deploy] pm2 reload --update-env"
