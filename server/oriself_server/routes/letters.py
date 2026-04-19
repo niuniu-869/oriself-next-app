@@ -625,9 +625,19 @@ async def compose_result(letter_id: str, db: Session = Depends(get_db)):
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
-        # 兜底：把未分类 exception 转成 structured 502，原文只进 server 日志
+        # 兜底：未分类 exception 转成 structured 502。原文进 server 日志；
+        # 响应里塞一条脱敏摘要（exception 类名 + 截断消息，不含栈和 provider URL），
+        # 方便没法直接看日志的人从 API 响应里就能定位根因。
         logger.exception("compose_result unhandled error: %s", exc)
+        exc_type = type(exc).__name__
+        raw_msg = str(exc)[:240]
+        # 粗过滤：去掉可能的 base_url / Authorization 残留
+        for tok in ("http://", "https://", "Bearer ", "api_key"):
+            raw_msg = raw_msg.replace(tok, "[redacted]")
         raise HTTPException(
             status_code=502,
-            detail={"message": "报告生成卡住了，请稍后重试", "reasons": []},
+            detail={
+                "message": "报告生成卡住了，请稍后重试",
+                "reasons": [f"{exc_type}: {raw_msg}"],
+            },
         )
