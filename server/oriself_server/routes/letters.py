@@ -602,10 +602,14 @@ async def compose_result(letter_id: str, db: Session = Depends(get_db)):
             TestResult(
                 session_id=letter_id,
                 mbti_type=co.mbti_type,
-                # v2.5.2 起不再存 insight/card/confidence 结构化字段；保留列但写 null。
-                insight_json=None,
-                card_json=None,
-                confidence_json=None,
+                # v2.5.2 起不再存 insight/card/confidence 结构化字段。
+                # 模型声明 nullable=True，但生产 v2.4 建的 SQLite 老库上这三列
+                # 仍带 NOT NULL 约束（create_all 不会 in-place 放宽），写 None
+                # 会 IntegrityError。空 JSON 对象 "{}" 两面都满足 —— 新库 nullable
+                # 无所谓，老库 NOT NULL 也通过。
+                insight_json="{}",
+                card_json="{}",
+                confidence_json="{}",
                 issue_slug=slug,
                 issue_title=title,
                 issue_html=safe_html,
