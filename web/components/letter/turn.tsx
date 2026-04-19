@@ -2,6 +2,7 @@
 
 import { memo } from "react";
 import type { TurnRecord } from "@/lib/types";
+import { Markdown } from "@/lib/markdown";
 import { QuillNote } from "./quill-note";
 
 interface Props {
@@ -21,23 +22,41 @@ interface Props {
  * 动画会反复重排很丑。现在只做两件事：`white-space: pre-wrap` 保留换行 +
  * streaming 时末尾挂一个 writing-cursor。
  * v2.5.3 · Oriself 气泡上方增加 QuillNote：token 之前就渲染，流完不消失，回看也在。
+ * v2.5.4 · streaming 已开始、但第一个 token 还没到的空档期（主要针对 Gemini 这类
+ * 有明显 thinking 阶段的 provider）显示「Oriself 思考中」占位；收到第一个
+ * token 后自动切回正文 + 游标。
+ * v2.5.4 · Oriself 正文接入 <Markdown>：支持粗体 / 斜体 / 行内代码 / 链接 /
+ * 有序&无序列表 / 引用 / 标题 / 分割线。用户轮保持纯文本 pre-wrap，避免把
+ * 自由书写里的 `*` / `**` 误识为 md 标记。
  */
 export const Turn = memo(function Turn({ turn, streaming = false }: Props) {
   if (turn.speaker === "oriself") {
+    const thinking = streaming && turn.text === "";
     return (
       <article className="mb-14 animate-settle">
         {turn.quill_lines && turn.quill_lines.length > 0 && (
           <QuillNote lines={turn.quill_lines} />
         )}
-        <p
-          className="fraunces-body text-[20px] leading-[1.62] tracking-tight text-ink"
-          style={{ whiteSpace: "pre-wrap" }}
-        >
-          {turn.text}
-          {streaming && (
-            <span className="writing-cursor inline-block align-baseline" />
-          )}
-        </p>
+        {thinking ? (
+          <p
+            className="fraunces-body-soft italic text-[17px] leading-[1.65] text-ink-muted"
+            aria-live="polite"
+          >
+            Oriself 思考中
+            <span className="animate-blink" aria-hidden>
+              …
+            </span>
+          </p>
+        ) : (
+          <Markdown
+            source={turn.text}
+            trailing={
+              streaming ? (
+                <span className="writing-cursor inline-block align-baseline" />
+              ) : null
+            }
+          />
+        )}
       </article>
     );
   }
