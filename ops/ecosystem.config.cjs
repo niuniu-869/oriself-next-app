@@ -24,7 +24,7 @@ const LOGS = path.join(ROOT, "logs");
 const SERVER_HOST = process.env.ORISELF_SERVER_HOST || "127.0.0.1";
 const SERVER_PORT = process.env.ORISELF_SERVER_PORT || "8000";
 const WEB_HOST = process.env.ORISELF_WEB_HOST || "127.0.0.1";
-const WEB_PORT = process.env.ORISELF_WEB_PORT || "3000";
+const WEB_PORT = process.env.ORISELF_WEB_PORT || "3003";
 
 // 让 web 通过 rewrite 打到本机的 server —— 与 next.config.mjs 契约对齐
 const API_INTERNAL_URL =
