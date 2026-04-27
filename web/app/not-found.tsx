@@ -1,7 +1,7 @@
 import Link from "next/link";
 
 /**
- * 全局 404 · v2.5.2
+ * 全局 404 · v2.5.4
  *
  * Next.js 默认那张纯白英文 "This page could not be found." 与整站中文 /
  * paper 主题完全不搭，访客一瞬间就出戏。这里用和首页一致的 Fraunces italic
