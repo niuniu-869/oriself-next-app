@@ -48,7 +48,6 @@ export default async function IssuePage({
 
       <IssueChrome
         slug={meta.slug}
-        initialIsPublic={meta.is_public}
         letterId={meta.letter_id ?? undefined}
       />
 
@@ -85,6 +84,8 @@ export async function generateMetadata({
     return {
       title: `${meta.title} · OriSelf`,
       description: `一封关于 ${meta.mbti_type} 的信。`,
+      // slug 即访问凭证：不让搜索引擎索引，未分享的链接才真正"私有"。
+      robots: { index: false, follow: false },
       openGraph: {
         title: meta.title,
         description: `一封关于 ${meta.mbti_type} 的信。`,

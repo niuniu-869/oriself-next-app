@@ -2,13 +2,11 @@
 
 import Link from "next/link";
 import { useCallback, useState } from "react";
-import { publishIssue } from "@/lib/api";
 import { FeedbackSheet } from "@/components/feedback/feedback-sheet";
 import { AuthorModal } from "@/components/primitives/author-modal";
 
 interface Props {
   slug: string;
-  initialIsPublic: boolean;
   letterId?: string;
 }
 
@@ -18,37 +16,16 @@ interface Props {
  * 设计：
  *  - 默认半透明、几乎贴底、文字而非图标，让 iframe 内的报告本身是视觉主角。
  *  - hover 时整条加深一点点，提示可交互。
- *  - 包含：← 返回首页 · 回看对话 · 再写一封 · 公开/私有 · 复制地址按钮 · 反馈
- *  - 复制地址按钮常驻展示中文文案 "复制地址"，一点即复制完整 URL；
- *    即使私有也允许复制（owner 自己要用），tooltip 会标注分享状态。
- *  - 公开/私有切换是 PATCH 调用，立刻反映到本地状态，乐观更新。
+ *  - 包含：← 返回首页 · 回看对话 · 再写一封 · 复制地址按钮 · 反馈
+ *  - 访问模型是 capability-URL：slug 即钥匙。不分享链接就没人看得到，
+ *    本人凭链接始终能看——所以这里没有"公开/私有"开关。
+ *  - 复制地址按钮一点即复制完整 URL，分享给想看的人。
  */
-export function IssueChrome({ slug, initialIsPublic, letterId }: Props) {
-  const [isPublic, setIsPublic] = useState(initialIsPublic);
-  const [toggling, setToggling] = useState(false);
+export function IssueChrome({ slug, letterId }: Props) {
   const [copied, setCopied] = useState(false);
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const [authorOpen, setAuthorOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  const handleTogglePublic = useCallback(async () => {
-    if (toggling) return;
-    setToggling(true);
-    setError(null);
-    const next = !isPublic;
-    // 乐观更新
-    setIsPublic(next);
-    try {
-      const res = await publishIssue(slug, next);
-      setIsPublic(res.is_public);
-    } catch (err) {
-      // 回滚
-      setIsPublic(!next);
-      setError(err instanceof Error ? err.message : "切换失败");
-    } finally {
-      setToggling(false);
-    }
-  }, [slug, isPublic, toggling]);
 
   const handleCopyLink = useCallback(async () => {
     try {
@@ -112,37 +89,15 @@ export function IssueChrome({ slug, initialIsPublic, letterId }: Props) {
             </button>
           </div>
 
-          {/* 右：公开开关 · 复制地址 · 反馈 */}
+          {/* 右：复制地址 · 反馈 */}
           <div className="flex items-center flex-wrap gap-x-3 sm:gap-x-4 gap-y-2">
-            <button
-              type="button"
-              onClick={handleTogglePublic}
-              disabled={toggling}
-              aria-pressed={isPublic}
-              className="hover:text-accent transition-colors disabled:opacity-50"
-              title={
-                isPublic
-                  ? "当前公开 · 任何人凭链接可看"
-                  : "当前私有 · 仅你可见，他人访问会 403"
-              }
-            >
-              {isPublic ? "● 公开" : "○ 私有"}
-            </button>
             {/* 复制地址按钮 · 中文文案 + ⎘；点击即复制完整 URL */}
             <button
               type="button"
               onClick={handleCopyLink}
               aria-label="复制这封信的地址"
-              className={`group inline-flex items-center gap-[6px] border rounded-[2px] px-[10px] py-[5px] normal-case tracking-[0.04em] transition-colors ${
-                isPublic
-                  ? "border-rule-strong hover:border-accent hover:text-accent"
-                  : "border-rule hover:border-accent/60 hover:text-accent/80"
-              }`}
-              title={
-                isPublic
-                  ? "复制这封信的地址"
-                  : "这封信当前私有 · 复制的链接只有你自己能打开"
-              }
+              className="group inline-flex items-center gap-[6px] border border-rule-strong rounded-[2px] px-[10px] py-[5px] normal-case tracking-[0.04em] transition-colors hover:border-accent hover:text-accent"
+              title="复制这封信的地址，分享给想看的人"
             >
               <span
                 className={`fraunces-body italic text-[11px] transition-colors ${

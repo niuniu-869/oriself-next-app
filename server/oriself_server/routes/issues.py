@@ -1,14 +1,16 @@
 """
-FastAPI routes · 公开报告（Issue）访问。
+FastAPI routes · 报告（Issue）访问。
 
 Issue 是一封信收敛后由 LLM 生成的完整 HTML 报告——每个 MBTI 类型有完全独立
-的视觉设计。slug 形如 `intj-a94b2c`，用户可选择公开后通过
-`/issues/{slug}` 分享。
+的视觉设计。访问模型是 capability-URL：slug 由 secrets 随机生成、收敛后只回给
+本人，链接本身即访问凭证——不分享就没人知道，本人凭链接始终能看。
+
+`issue_is_public` 不再是访问门，只表示「是否同意收录进未来的公开展示墙」。
 
 提供：
 - `GET /issues/{slug}`            · 元数据（JSON）
 - `GET /issues/{slug}/render`     · 完整 HTML 文档，供前端 iframe 沙箱嵌入
-- `PATCH /issues/{slug}/publish`  · 切换公开/私有（MVP 不鉴权；生产需 owner token）
+- `PATCH /issues/{slug}/publish`  · 切换 issue_is_public（展示墙开关；MVP 不鉴权）
 """
 from __future__ import annotations
 
@@ -61,7 +63,7 @@ class PublishRequest(BaseModel):
 
 @router.get("/{slug}", response_model=IssueResponse)
 def get_issue(slug: str, db: Session = Depends(get_db)):
-    """元数据。公开才可访问。"""
+    """元数据。凭 slug 即可访问（capability-URL）。"""
     result = (
         db.query(TestResult)
         .filter(TestResult.issue_slug == slug)
@@ -69,8 +71,6 @@ def get_issue(slug: str, db: Session = Depends(get_db)):
     )
     if result is None or not result.issue_html:
         raise HTTPException(status_code=404, detail="issue not found")
-    if not result.issue_is_public:
-        raise HTTPException(status_code=403, detail="issue is private")
     return IssueResponse(
         slug=result.issue_slug,
         title=result.issue_title or result.mbti_type,
@@ -99,11 +99,6 @@ def render_issue(slug: str, db: Session = Depends(get_db)):
             content="<!doctype html><title>404</title><h1>Issue not found</h1>",
             status_code=404,
         )
-    if not result.issue_is_public:
-        return HTMLResponse(
-            content="<!doctype html><title>403</title><h1>This issue is private</h1>",
-            status_code=403,
-        )
 
     # 关键：沙箱化 LLM 生成的 HTML
     headers = {
@@ -124,10 +119,10 @@ def publish_issue(
     slug: str, req: PublishRequest, db: Session = Depends(get_db)
 ):
     """
-    切换 issue 公开 / 私有。
+    切换 issue_is_public（是否收录进未来的公开展示墙）。
 
-    MVP 不鉴权——任何知道 slug 的人都能改（slug 本身是只在收敛后返回给 owner
-    的）。生产阶段应换成 owner token / JWT。
+    注意：这不影响访问——任何持有 slug 的人都能看 issue。此开关只决定将来
+    展示墙是否列出它。MVP 不鉴权；生产阶段应换成 owner token / JWT。
     """
     result = (
         db.query(TestResult)

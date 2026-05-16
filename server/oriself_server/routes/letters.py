@@ -69,7 +69,8 @@ router = APIRouter(prefix="/letters", tags=["letters"])
 
 
 def _generate_issue_slug(mbti_type: str) -> str:
-    return f"{mbti_type.lower()}-{secrets.token_hex(3)}"
+    # slug 即访问凭证（capability-URL），用 64 bit 随机熵避免被遍历。
+    return f"{mbti_type.lower()}-{secrets.token_hex(8)}"
 
 
 # ---------------------------------------------------------------------------
