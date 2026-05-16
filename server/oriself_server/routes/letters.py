@@ -41,12 +41,27 @@ from ..models import Conversation, TestResult, TestSession
 from ..schemas import MAX_ROUNDS, MIN_CONVERGE_ROUND, UserPreferences
 from ..skill_loader import load_skill_bundle
 from ..skill_runner import (
+    Pass1Trace,
     ReportRunner,
     SessionState,
     Turn,
     TurnRunner,
     _parse_preferences_heuristic,
 )
+
+
+def _resolve_loader_mode() -> str:
+    """读 ORISELF_SKILL_LOADING；只接受 static / on-demand，其他/未设回退到默认。
+
+    v2.6.x 起默认 = on-demand（真模型按需加载，与 SKILL.md L203 progressive
+    disclosure 设计一致）。保留 static 作为灰度回滚开关——线上若发现 on-demand
+    带来的 Pass 1 延迟/成本不可接受，可设 ORISELF_SKILL_LOADING=static 临时回退。
+    路由这一层不替模型决策，env 里写啥就用啥。
+    """
+    raw = (os.environ.get("ORISELF_SKILL_LOADING") or "on-demand").strip().lower()
+    if raw not in ("static", "on-demand"):
+        raw = "on-demand"
+    return raw
 from ..utils.html_sanitize import sanitize_report_html
 
 
@@ -153,6 +168,19 @@ def _load_session_state(db: Session, session_id: str) -> SessionState:
                     q_lines = [str(x) for x in parsed if isinstance(x, str)]
             except Exception:
                 q_lines = []
+        # v2.6 · 把已加载 skill 名字回灌到 Turn，让 runner 在下一轮 Pass 1
+        # 看到 "本会话已读" 列表，避免 redundant_read。
+        loaded_names: List[str] = []
+        raw_loaded = getattr(c, "loaded_skill_names", None)
+        if raw_loaded:
+            try:
+                parsed_loaded = json.loads(raw_loaded)
+                if isinstance(parsed_loaded, list):
+                    loaded_names = [
+                        str(x) for x in parsed_loaded if isinstance(x, str)
+                    ]
+            except Exception:
+                loaded_names = []
         turns.append(
             Turn(
                 round_number=c.round_number,
@@ -161,6 +189,7 @@ def _load_session_state(db: Session, session_id: str) -> SessionState:
                 status=c.status_sentinel or "CONTINUE",
                 discarded=bool(c.discarded),
                 quill_lines=q_lines,
+                loaded_skills=loaded_names,
             )
         )
     prefs = None
@@ -209,8 +238,12 @@ def _persist_turn(
     visible_text: str,
     status: str,
     quill_lines: Optional[List[str]] = None,
+    pass1_trace: Optional[Pass1Trace] = None,
 ) -> int:
-    """把一轮对话写入 DB；顺便更新 session 状态。返回 round_number。"""
+    """把一轮对话写入 DB；顺便更新 session 状态。返回 round_number。
+
+    v2.6 · `pass1_trace` 非空时把 Pass 1 七字段一并落库（on-demand 模式才有）。
+    """
     state = _load_session_state(db, sess.session_id)
     round_number = state.round_count + 1
 
@@ -235,7 +268,7 @@ def _persist_turn(
         if quill_lines
         else None
     )
-    conv = Conversation(
+    conv_kwargs = dict(
         session_id=sess.session_id,
         round_number=round_number,
         user_message=user_message,
@@ -245,6 +278,41 @@ def _persist_turn(
         discarded=False,
         quill_json=quill_blob,
     )
+    if pass1_trace is not None:
+        # codex 复审 P2-2：把 LLM 在 Pass 1 偷写到 message.content 的内容
+        # 也落到 pass1_violations_json（共载体，避免再加一列）。这是 benchmark
+        # 复盘 ADR-2 违反"Pass 1 不得创作"的关键观测信号；丢了就再也找不回来。
+        violations_payload = [
+            {"kind": v.kind, "detail": v.detail}
+            for v in pass1_trace.violations
+        ]
+        if pass1_trace.content_dropped:
+            violations_payload.append(
+                {
+                    "kind": "pass1_content_dropped",
+                    "detail": pass1_trace.content_dropped[:2000],
+                }
+            )
+        conv_kwargs.update(
+            tool_calls_json=pass1_trace.tool_calls_json,
+            loaded_skill_names=json.dumps(
+                pass1_trace.loaded_skill_names, ensure_ascii=False
+            ),
+            pass1_violations_json=json.dumps(
+                violations_payload, ensure_ascii=False
+            ),
+            chosen_phase_key=pass1_trace.chosen_phase_key,
+            phase_match_rn=pass1_trace.phase_match_rn,
+            skill_loader_mode=pass1_trace.skill_loader_mode,
+            model=pass1_trace.model,
+        )
+    else:
+        # static 模式也写一下 mode + model，方便 benchmark 区分
+        conv_kwargs.update(
+            skill_loader_mode="static",
+            model=str(getattr(sess, "provider", "")) or None,
+        )
+    conv = Conversation(**conv_kwargs)
     db.add(conv)
 
     # R2 → 解析 preferences
@@ -281,13 +349,15 @@ async def _stream_turn_core(
 
     bundle = load_skill_bundle()
     backend = make_backend(sess.provider)
-    runner = TurnRunner(backend=backend, bundle=bundle)
+    loader_mode = _resolve_loader_mode()
+    runner = TurnRunner(backend=backend, bundle=bundle, loader_mode=loader_mode)
 
     raw_accum = ""
     visible = ""
     status = "CONTINUE"
     had_error = False
     quill_lines: List[str] = []
+    pass1_trace: Optional[Pass1Trace] = None
 
     try:
         async for kind, payload in runner.stream_turn(
@@ -303,6 +373,10 @@ async def _stream_turn_core(
                 if isinstance(payload, list) and payload:
                     quill_lines = [str(x) for x in payload if isinstance(x, str)]
                     yield _sse("quill", {"lines": quill_lines})
+            elif kind == "pass1":
+                # v2.6 · Pass 1 trace 仅落库，不发给前端。前端在 quill 之后等 token。
+                if isinstance(payload, Pass1Trace):
+                    pass1_trace = payload
             elif kind == "error":
                 had_error = True
                 yield _sse("error", {"message": payload})
@@ -328,10 +402,24 @@ async def _stream_turn_core(
     if not visible:
         visible = raw_accum.strip()
 
+    # v2.6.x · "STATUS-only" 空回复护栏：LLM 偶发整段输出只有一行 STATUS sentinel，
+    # 经 parse_status_sentinel 剥除后 visible 为空——前端会渲染一个"oriself 没说话"
+    # 的空气泡，且这条脏轮会污染后续 history 让模型继续模仿样式。
+    # 处理：发 SSE error 让前端提示用户重发，**不**把这一轮 persist 到 conversations，
+    # 保持 round_count 不变。前端可自动重试一次或提示用户点"重写"。
+    current_round = state.round_count + 1
+    if not visible.strip():
+        logger.warning(
+            "oriself empty visible at round=%d (raw=%r); emitting SSE error and not persisting",
+            current_round,
+            raw_accum[:80],
+        )
+        yield _sse("error", {"message": "ORISELF_EMPTY_REPLY"})
+        return
+
     # 护栏：LLM 偶发过早声明 CONVERGE（R6 之前）→ 静默降级为 CONTINUE。
     # 不降级则 R2 就触发报告生成、sess 被置 completed，前端跳 issue 页，
     # 从用户视角就是"刚发第二句就再也无法输入"。
-    current_round = state.round_count + 1
     if status == "CONVERGE" and current_round < MIN_CONVERGE_ROUND:
         logger.info(
             "suppressed early CONVERGE at round=%d (<MIN_CONVERGE_ROUND=%d)",
@@ -342,7 +430,14 @@ async def _stream_turn_core(
 
     try:
         round_number = _persist_turn(
-            db, sess, user_message, raw_accum, visible, status, quill_lines
+            db,
+            sess,
+            user_message,
+            raw_accum,
+            visible,
+            status,
+            quill_lines,
+            pass1_trace=pass1_trace,
         )
     except HTTPException as he:
         yield _sse("error", {"message": he.detail, "status_code": he.status_code})

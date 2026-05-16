@@ -82,6 +82,22 @@ class Conversation(Base):
     # v2.5.3 · 本轮展示给用户的 Oriself 笔触（JSON 数组：["Oriself 想多问一些", ...]）。
     # 永久留在回看页上，和 oriself_text 一起构成这一轮的完整呈现。
     quill_json = Column(Text, nullable=True)
+    # v2.6 · 真模型按需加载（Phase D · tool-use loop） · 7 个 trace 字段。
+    # 静态模式（ORISELF_SKILL_LOADING=static）下这些列为 NULL。on-demand 模式下：
+    # - tool_calls_json: Pass 1 LLM 调用清单原文（含 raw_arguments / parse error）
+    # - loaded_skill_names: 实际加载的 skill 名字数组（去重过滤后），JSON array
+    # - pass1_violations_json: 6 项校验里命中的 [{kind, detail}, ...]
+    # - chosen_phase_key: LLM 这一轮选了哪个 phase
+    # - phase_match_rn: 是否与 v2.5 choose_phase_key 推算结果一致（仅观测）
+    # - skill_loader_mode: "static" / "on-demand"
+    # - model: 配合 sess.provider 一起做 benchmark 复盘用
+    tool_calls_json = Column(Text, nullable=True)
+    loaded_skill_names = Column(Text, nullable=True)
+    pass1_violations_json = Column(Text, nullable=True)
+    chosen_phase_key = Column(String(32), nullable=True)
+    phase_match_rn = Column(Boolean, nullable=True)
+    skill_loader_mode = Column(String(16), nullable=True)
+    model = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 

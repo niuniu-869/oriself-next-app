@@ -54,7 +54,7 @@ def test_load_skill_bundle_smoke():
     assert bundle.skill_md, "SKILL.md body not loaded"
     # frontmatter 解析出来
     assert bundle.skill_meta.get("name") == "oriself"
-    assert bundle.skill_meta.get("version") == "2.5.2"
+    assert bundle.skill_meta.get("version") == "2.6.0"
     # reference 文件全到位
     assert "ethos" in bundle.refs
     assert "converge" in bundle.refs

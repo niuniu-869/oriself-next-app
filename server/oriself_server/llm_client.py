@@ -1,17 +1,15 @@
 """
-多 provider LLM 客户端 · v2.5.2。
+多 provider LLM 客户端 · v2.6.0。
 
-v2.5.2 变化：
-- converge 不再走 JSON schema：`complete_json` → `complete_text`，返回整段字符串
-  （LLM 直吐 HTML）。服务端从 HTML 抽 MBTI + title，见 guardrails.py
-- 默认 converge timeout 从 120s 提到 300s（长 HTML 生成 + 后端长尾）
+v2.6.0 变化（真模型按需）：
+- 新增 `call_tools_only(messages, tools)` 抽象：Pass 1 工具规划契约。
+  非流式、强制返回 tool_calls、message.content 永远丢弃。
+- OpenAICompatibleBackend 用 `tool_choice="required"` 实现（deepseek/qwen/openai 都支持）。
+- MockBackend 给出 happy-path fixture：每轮选 1 phase + 0..2 technique，R1-R3 含 exemplary-session。
 
-v2.4 保留：
-- 每个 backend 暴露两个方法：
-    * `stream_text(messages)` → `AsyncIterator[str]` · 对话轮 SSE
-    * `complete_text(messages)` → `str` · 报告生成（converge）
-- 对话轮不再要 JSON，provider 侧不传 `response_format`
-- MockBackend 产出带 `STATUS: ...` 末行的文本；converge 产 HTML
+v2.5.2 保留：
+- converge 走 `complete_text` 直吐 HTML；timeout 默认 300s。
+- 对话轮 `stream_text`，provider 不传 `response_format`。
 
 支持的 provider：
 - `openai_compatible`（Qwen / DeepSeek / Kimi / OpenAI / 302.ai Gemini 等兼容端）
@@ -23,8 +21,8 @@ import json
 import os
 import random
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import AsyncIterator, List
+from dataclasses import dataclass, field
+from typing import AsyncIterator, Dict, List, Optional
 
 import httpx
 
@@ -39,6 +37,39 @@ class Message:
     role: str  # system | user | assistant
     content: str
     cache_breakpoint: bool = False  # 预留给未来 Anthropic cache_control
+
+
+# ---------------------------------------------------------------------------
+# Tool call（v2.6 · Pass 1 协议契约）
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ToolCallRequest:
+    """LLM 在 Pass 1 调用工具的解析结果。
+
+    `arguments` 已经由调用方解析为 dict；解析失败时 `arguments_parse_error` 非空，
+    此时 arguments={}，供上层判定 `invalid_skill` 等违规。
+    """
+
+    name: str
+    arguments: Dict[str, object] = field(default_factory=dict)
+    raw_arguments: str = ""
+    call_id: Optional[str] = None
+    arguments_parse_error: Optional[str] = None
+
+
+@dataclass
+class Pass1Result:
+    """Pass 1 完整返回结构，供 harness 落 trace 用。
+
+    `content_dropped` 始终为 message.content 原文：协议要求**整段丢弃**，
+    但仍要记录到 DB 让 benchmark 能看到 LLM 是否在 Pass 1 偷写了正文。
+    """
+
+    tool_calls: List[ToolCallRequest] = field(default_factory=list)
+    content_dropped: str = ""
+    raw_response: Dict[str, object] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +98,24 @@ class LLMBackend(ABC):
         timeout: float = 300.0,
     ) -> str:
         """报告轮 · 一次请求返回完整文本（HTML）。失败抛异常。"""
+        ...
+
+    @abstractmethod
+    async def call_tools_only(
+        self,
+        messages: List[Message],
+        tools: List[dict],
+        *,
+        timeout: float = 60.0,
+        tool_choice: str = "required",
+    ) -> Pass1Result:
+        """Pass 1 · 工具规划契约。
+
+        - 非流式调用，禁止 stream
+        - 服务端要求 `tool_choice="required"`，强制 LLM 选一个工具
+        - message.content 一律丢弃（v2.6 ADR-2）；调用方只读 tool_calls
+        - 失败抛异常；不做兜底（v2.6 ADR-6 · 不兜底但全可观测）
+        """
         ...
 
 
@@ -172,6 +221,106 @@ class OpenAICompatibleBackend(LLMBackend):
         if not isinstance(content, str):
             raise ValueError(f"LLM returned non-string content: {type(content)}")
         return content
+
+    # ---- Pass 1 · 工具规划契约（v2.6） ----
+    async def call_tools_only(
+        self,
+        messages: List[Message],
+        tools: List[dict],
+        *,
+        timeout: float = 60.0,
+        tool_choice: str = "required",
+    ) -> Pass1Result:
+        """OpenAI compatible：tool_choice="required"，stream=False，丢弃 content。
+
+        provider 兼容性：
+        - OpenAI / DeepSeek / Qwen DashScope / Kimi 都支持 tool_choice="required"。
+        - Gemini-302 走 OpenAI compatible 路径同样支持。
+        - 任何 provider 报错（4xx/5xx）直接抛异常，不兜底——这是 v2.6 ADR-6。
+        """
+        payload: dict = {
+            "model": self.model,
+            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "tools": tools,
+            "tool_choice": tool_choice,
+            "stream": False,
+        }
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                f"{self.base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            if resp.status_code >= 400:
+                body = resp.text
+                raise RuntimeError(
+                    f"{self.provider_name} call_tools_only "
+                    f"{resp.status_code}: {body[:400]}"
+                )
+            data = resp.json()
+        return _parse_pass1_response(data)
+
+
+# ---------------------------------------------------------------------------
+# Pass 1 解析 helper
+# ---------------------------------------------------------------------------
+
+
+def _parse_pass1_response(data: dict) -> Pass1Result:
+    """OpenAI compatible chat/completions 响应 → Pass1Result。
+
+    - 解析 `choices[0].message.tool_calls`，每个含 function.name / arguments。
+    - arguments 是字符串，用 json.loads 解析；失败时把原文留在 raw_arguments，
+      并记 arguments_parse_error，上层按 `invalid_skill` 处置。
+    - message.content 整段保留到 content_dropped 字段（不还给 caller，但落 trace 用）。
+    """
+    choices = data.get("choices") or []
+    if not choices:
+        raise ValueError("call_tools_only: empty choices in response")
+    msg = choices[0].get("message") or {}
+    tool_calls_raw = msg.get("tool_calls") or []
+    parsed_calls: List[ToolCallRequest] = []
+    for tc in tool_calls_raw:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        name = str(fn.get("name") or "")
+        raw_args = fn.get("arguments")
+        if raw_args is None:
+            raw_args_str = ""
+        elif isinstance(raw_args, str):
+            raw_args_str = raw_args
+        else:
+            raw_args_str = json.dumps(raw_args, ensure_ascii=False)
+        parsed_args: Dict[str, object] = {}
+        parse_err: Optional[str] = None
+        if raw_args_str:
+            try:
+                obj = json.loads(raw_args_str)
+                if isinstance(obj, dict):
+                    parsed_args = obj
+                else:
+                    parse_err = f"arguments not object: {type(obj).__name__}"
+            except json.JSONDecodeError as exc:
+                parse_err = f"json decode: {exc}"
+        parsed_calls.append(
+            ToolCallRequest(
+                name=name,
+                arguments=parsed_args,
+                raw_arguments=raw_args_str,
+                call_id=str(tc.get("id") or "") or None,
+                arguments_parse_error=parse_err,
+            )
+        )
+    content = msg.get("content")
+    return Pass1Result(
+        tool_calls=parsed_calls,
+        content_dropped=content if isinstance(content, str) else "",
+        raw_response=data,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -282,11 +431,13 @@ _MOCK_CONVERGE_HTML = """<!DOCTYPE html>
 
 
 class MockBackend(LLMBackend):
-    """确定性脚本 mock · v2.5.2 · 文本流 + 收束 HTML。
+    """确定性脚本 mock · v2.6.0。
 
     - `stream_text`：按轮数从 _MOCK_TURN_SCRIPTS 取一条文本，逐字 yield；
       末尾补一行 `STATUS: CONTINUE`。到第 8 轮改成 `STATUS: CONVERGE`。
     - `complete_text`：返回一份自包含 mock HTML 文档。
+    - `call_tools_only`（v2.6 新增）：happy-path fixture，按推断轮数返回
+      合规 tool_calls：1 phase + 0..2 technique；R1-R3 含 exemplary-session。
     """
 
     provider_name = "mock"
@@ -321,6 +472,66 @@ class MockBackend(LLMBackend):
         timeout: float = 300.0,
     ) -> str:
         return _MOCK_CONVERGE_HTML
+
+    # ---- Pass 1 · 工具规划契约 ----
+    async def call_tools_only(
+        self,
+        messages: List[Message],
+        tools: List[dict],
+        *,
+        timeout: float = 60.0,
+        tool_choice: str = "required",
+    ) -> Pass1Result:
+        """Mock fixture：基于消息里的 user-轮数推断 phase 选择。
+
+        规则（codex 第 7 轮 P3 修复 · 不依赖实例状态）：
+        HTTP 路由每轮 make_backend 创建新 MockBackend 实例 → 实例字段会重置；
+        因此跨轮去重只能基于 messages 推断的 user_rounds 数（=本轮号），用一份
+        固定的 R→names 映射来保证：
+        - phase 每轮强制选（R≥4 仍 重复同一 phase 是协议常态，服务端不记 redundant）
+        - R1-R3 协议必选 exemplary-session（服务端 R1-R3 跨轮重读豁免）
+        - technique 在第一次进入需要它的 phase 时选；后续同 phase 轮不再选
+        - 永远只调 read_skill 一次；arguments.names 控制在 ≤ 4
+
+        固定 R→names 映射：
+        - R1: phase-onboarding + exemplary-session
+        - R2: phase-warmup + reflective-listening + exemplary-session
+        - R3: phase-warmup + exemplary-session  (reflective-listening 已在 R2 选过)
+        - R4: phase-exploring + situational-questions
+        - R5: phase-exploring  (situational-questions 已在 R4 选过)
+        - R6: phase-deep + contradiction-probing
+        - R7+: phase-deep  (contradiction-probing / situational-questions 已选)
+        """
+        user_rounds = [m for m in messages if m.role == "user"]
+        rn = max(1, len(user_rounds))
+        if rn == 1:
+            names = ["phase-onboarding", "exemplary-session"]
+        elif rn == 2:
+            names = ["phase-warmup", "reflective-listening", "exemplary-session"]
+        elif rn == 3:
+            names = ["phase-warmup", "exemplary-session"]
+        elif rn == 4:
+            names = ["phase-exploring", "situational-questions"]
+        elif rn == 5:
+            names = ["phase-exploring"]
+        elif rn == 6:
+            names = ["phase-deep", "contradiction-probing"]
+        else:
+            names = ["phase-deep"]
+        args = {"names": names}
+        raw_args = json.dumps(args, ensure_ascii=False)
+        return Pass1Result(
+            tool_calls=[
+                ToolCallRequest(
+                    name="read_skill",
+                    arguments=args,
+                    raw_arguments=raw_args,
+                    call_id=f"mock-call-{rn}",
+                )
+            ],
+            content_dropped="",
+            raw_response={"mock": True, "round": rn},
+        )
 
 
 # ---------------------------------------------------------------------------

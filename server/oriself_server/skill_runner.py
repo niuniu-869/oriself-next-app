@@ -1,26 +1,30 @@
 """
-Skill runner · v2.5.2 主引擎。
+Skill runner · v2.6.0 主引擎。
 
-设计：
-- 对话轮 (`TurnRunner.stream_turn`) · 流式文本 async generator
+模式：
+- `loader_mode="static"`（默认 · 等价 v2.5.x）：
     - 拼 system prompt：SKILL.md + ETHOS.md + domain + 当前 phase + techniques + exemplary
-    - 拼 history：往轮的 (user, oriself_visible) 对
-    - 调 backend.stream_text()，token 透传给上层
+    - 拼 history → backend.stream_text() → token 透传
     - stream 结束后从尾部解析 STATUS sentinel，剥除，返回 ParsedTurn
     - **不 retry，不 fallback**。LLM 输出什么用户就看到什么。不满意由前端点「重写」。
-- 报告轮 (`ReportRunner.compose`) · v2.5.2 · LLM 直吐 HTML
-    - 独立 prompt：CONVERGE.md + domain + 元数据（session_id_short / today）
-    - 调 backend.complete_text()，拿原始文本
-    - 剥 markdown fence → shape/parse/extract/consistency 链
-    - 最多 3 次 retry；失败返回 None，由 routes 层告诉用户「报告生成卡住了」
+- `loader_mode="on-demand"`（v2.6 · 真模型按需）：
+    - Pass 1（call_tools_only）：system = SKILL+ETHOS+Runtime+Skill Index；
+      tools = [read_skill]；强制只回 tool_calls；message.content 整段丢弃
+    - read_skill_batch + 6 项校验（zero_tool_read / over_budget / invalid_skill /
+      phase_missing / exemplary_skipped / redundant_read）—— **不兜底只记录**
+    - Pass 2（stream_text）：system = SKILL+ETHOS+Runtime+Loaded Skills；tools=[]
+    - 末尾 STATUS sentinel 解析仅在 Pass 2
+
+报告轮 (`ReportRunner.compose`) · v2.5.2 · LLM 直吐 HTML（与对话轮无关，不动）。
 """
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import AsyncIterator, List, Optional, Tuple
+from typing import AsyncIterator, Dict, List, Optional, Tuple
 
 from .guardrails import (
     ParsedTurn,
@@ -31,7 +35,7 @@ from .guardrails import (
     verify_report_html_shape,
     extract_card_title_from_html,
 )
-from .llm_client import LLMBackend, Message
+from .llm_client import LLMBackend, Message, Pass1Result, ToolCallRequest
 from .quill import derive_lines as _derive_quill_lines
 from .schemas import (
     ConvergeOutput,
@@ -42,7 +46,15 @@ from .schemas import (
     UserPreferences,
     effective_target_rounds,
 )
-from .skill_loader import SkillBundle, load_skill_bundle
+from .skill_loader import (
+    LoadedSkill,
+    ReadSkillResult,
+    SkillBundle,
+    SkillViolation,
+    load_skill_bundle,
+    read_skill_batch,
+    read_skill_tool_schema,
+)
 from .utils.prompt_sanitize import sanitize_user_input
 
 
@@ -63,6 +75,9 @@ class Turn:
     status: str = "CONTINUE"        # CONTINUE / CONVERGE / NEED_USER
     discarded: bool = False         # 用户点「重写」后旧轮标这个
     quill_lines: List[str] = field(default_factory=list)  # v2.5.3 · 本轮给用户看的笔触批注
+    # v2.6 · 本轮 Pass 1 真实加载到的 skill 名字（routes 层 `_load_session_state`
+    # 从 conversations.loaded_skill_names 列读出回灌；on-demand 模式才有值）
+    loaded_skills: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -158,6 +173,135 @@ def choose_phase_key(session: SessionState, current_round: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _runtime_state_block_pass1(
+    session: SessionState,
+    current_round: int,
+    target_rounds: int,
+    *,
+    bundle: Optional[SkillBundle] = None,
+) -> str:
+    """v2.6 Pass 1 用的 Runtime State 块。
+
+    codex 第 5 轮 P2 修复：
+    - "已读 skill" 列表里**不**包含 phase（每轮必选）
+    - **不**包含 exemplary-session 当 current_round ≤ 3 时（R1-R3 必选）
+    - 文字改成"本会话已读的 technique / domain（不必再选）"，避免与铁则 #3/#4 冲突
+
+    与 v2.5 的 `_runtime_state_block` 不同：
+    - **不预设** phase（让 LLM 自己选）
+    - 末尾不写 STATUS 提醒（Pass 1 不输出正文）
+    """
+    today = _dt.date.today()
+    session_id_short = (session.session_id or "")[:8]
+    prefs = session.user_preferences
+    prefs_line = ""
+    if prefs is not None and current_round > ONBOARDING_ROUND:
+        prefs_line = (
+            f"\n- 用户偏好（Phase 0 握手得出）：style={prefs.style}, "
+            f"target_rounds={prefs.target_rounds or '(默认 20)'}, pace={prefs.pace}"
+            f"{(', 开场情绪=' + prefs.opening_mood) if prefs.opening_mood else ''}"
+            f"{(', 备注=' + prefs.note) if prefs.note else ''}"
+        )
+    already_all = _collect_already_loaded_from_history(session)
+    already_filtered: List[str] = []
+    if bundle is not None:
+        for n in already_all:
+            # 协议每轮必选项不进"不必再选"列表
+            if bundle.is_phase_name(n):
+                continue
+            if (
+                bundle.is_example_name(n)
+                and n == "exemplary-session"
+                and 1 <= current_round <= 3
+            ):
+                continue
+            already_filtered.append(n)
+    else:
+        already_filtered = already_all
+    already_line = ""
+    if already_filtered:
+        already_line = (
+            "\n- 本会话此前 Pass 1 已读过的 technique / domain："
+            + ", ".join(already_filtered)
+            + "\n  · 默认不必重读（你上一轮 assistant 回复在 history 里）"
+            + "；本轮要再次看到该 skill 全文则重选——会记 redundant_read 但 Pass 2 仍会装载"
+        )
+    return (
+        f"\n\n---\n\n# Runtime State\n"
+        f"- 当前轮：R{current_round} / target {target_rounds}（hard_cap {MAX_ROUNDS}）\n"
+        f"- session_id_short：{session_id_short}\n"
+        f"- 今日：{today.isoformat()}"
+        f"{prefs_line}{already_line}"
+    )
+
+
+def _runtime_state_block_pass2(
+    session: SessionState,
+    current_round: int,
+    target_rounds: int,
+    chosen_phase: Optional[str],
+) -> str:
+    """Pass 2 用的 Runtime State 块。
+
+    与 Pass 1 的差异：
+    - 写明本轮 phase（chosen by Pass 1）
+    - 末尾恢复 STATUS 协议提醒（这才是真正出正文的轮）
+    """
+    today = _dt.date.today()
+    session_id_short = (session.session_id or "")[:8]
+    prefs = session.user_preferences
+    prefs_line = ""
+    if prefs is not None and current_round > ONBOARDING_ROUND:
+        prefs_line = (
+            f"\n- 用户偏好：style={prefs.style}, "
+            f"target_rounds={prefs.target_rounds or '(默认 20)'}, pace={prefs.pace}"
+            f"{(', 开场情绪=' + prefs.opening_mood) if prefs.opening_mood else ''}"
+            f"{(', 备注=' + prefs.note) if prefs.note else ''}"
+        )
+    return (
+        f"\n\n---\n\n# Runtime State\n"
+        f"- 当前轮：R{current_round} / target {target_rounds}（hard_cap {MAX_ROUNDS}）\n"
+        f"- 本轮 phase：{chosen_phase or '<未选 · phase_missing>'}\n"
+        f"- session_id_short：{session_id_short}\n"
+        f"- 今日：{today.isoformat()}"
+        f"{prefs_line}\n\n"
+        f"# 记得结尾带 STATUS 行\n\n"
+        f"最末一行独立写一个：`STATUS: CONTINUE` / `STATUS: CONVERGE` / `STATUS: NEED_USER`。"
+        f"服务端会自动剥除，用户看不到这行。漏写按 CONTINUE 处理。"
+    )
+
+
+def _collect_already_loaded_from_history(session: SessionState) -> List[str]:
+    """从 SessionState.turns 反推此前已经加载过的 skill 名字。
+
+    依赖 routes 层 `_load_session_state` 把 conversations.loaded_skill_names
+    回填到 Turn.loaded_skills（见 v2.6 Conversation 表新增字段）。无信息时返空。
+    """
+    out: List[str] = []
+    seen: set = set()
+    for t in session.live_turns():
+        for n in (t.loaded_skills or []):
+            if n and n not in seen:
+                out.append(n)
+                seen.add(n)
+    return out
+
+
+def _serialize_tool_calls(calls: List[ToolCallRequest]) -> str:
+    """tool_calls → JSON string，落 conversations.tool_calls_json。"""
+    payload = [
+        {
+            "name": c.name,
+            "raw_arguments": c.raw_arguments,
+            "arguments": c.arguments,
+            "call_id": c.call_id,
+            "arguments_parse_error": c.arguments_parse_error,
+        }
+        for c in calls
+    ]
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def _runtime_state_block(
     session: SessionState,
     current_round: int,
@@ -195,14 +339,44 @@ def _runtime_state_block(
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class Pass1Trace:
+    """v2.6 · 单轮 Pass 1 的 trace，由 routes 层落库到 conversations 表。
+
+    字段语义对应设计文档 §4 Conversation 表新增列：
+    - `tool_calls_json`: 原始 tool_calls 调用清单（含未解析的 raw_arguments）
+    - `loaded_skill_names`: 实际加载的文件（去重 + 过滤后）
+    - `pass1_violations`: 6 项校验里命中的（含 zero_tool_read 由 runner 层补）
+    - `chosen_phase_key`: LLM 这轮选了哪个 phase（不在 catalogue 时为 None）
+    - `phase_match_rn`: phase 与 Rn"常规对应"是否一致（仅观测）
+    - `skill_loader_mode`: "on-demand" / "static"
+    - `model`: 复盘必需（与 provider 配合）
+    """
+    tool_calls_json: str
+    loaded_skill_names: List[str]
+    violations: List[SkillViolation]
+    chosen_phase_key: Optional[str]
+    phase_match_rn: bool
+    skill_loader_mode: str
+    model: str
+    content_dropped: str = ""
+
+
 class TurnRunner:
     def __init__(
         self,
         backend: LLMBackend,
         bundle: Optional[SkillBundle] = None,
+        *,
+        loader_mode: str = "static",
     ):
         self.backend = backend
         self.bundle = bundle or load_skill_bundle()
+        if loader_mode not in ("static", "on-demand"):
+            raise ValueError(
+                f"loader_mode must be 'static' or 'on-demand', got: {loader_mode!r}"
+            )
+        self.loader_mode = loader_mode
 
     def _build_conversation_messages(
         self,
@@ -244,10 +418,11 @@ class TurnRunner:
         *,
         rewrite_hint: Optional[str] = None,
     ) -> AsyncIterator[Tuple[str, object]]:
-        """对话轮 · 流式生成。
+        """对话轮 · 流式生成。按 loader_mode 分发。
 
         yields tuples of (kind, payload):
           - ("quill", List[str]) · token 开始前的笔触批注（0..2 条）
+          - ("pass1", Pass1Trace) · 仅 on-demand 模式；Pass 1 trace，供 routes 落库
           - ("token", str) · token chunk，直接透传给用户
           - ("final",  "")  · 流结束前的标记（紧跟 status + visible）
           - ("status", CONTINUE/CONVERGE/NEED_USER)
@@ -255,6 +430,27 @@ class TurnRunner:
           - ("error", err_message)
         """
         user_message = sanitize_user_input(user_message_raw, max_length=4000)
+        if self.loader_mode == "on-demand":
+            async for item in self._stream_turn_on_demand(
+                session, user_message, rewrite_hint=rewrite_hint
+            ):
+                yield item
+        else:
+            async for item in self._stream_turn_static(
+                session, user_message, rewrite_hint=rewrite_hint
+            ):
+                yield item
+
+    # ------------------------------------------------------------------
+    # Static 模式（v2.5.x 行为，保留作为 feature flag 回滚开关）
+    # ------------------------------------------------------------------
+    async def _stream_turn_static(
+        self,
+        session: SessionState,
+        user_message: str,
+        *,
+        rewrite_hint: Optional[str] = None,
+    ) -> AsyncIterator[Tuple[str, object]]:
         # 先算 quill（token 之前就要给前端，制造"Oriself 在落笔前停了一下"的节奏）
         current_round = session.round_count + 1
         phase_key = choose_phase_key(session, current_round)
@@ -277,7 +473,6 @@ class TurnRunner:
 
         messages = self._build_conversation_messages(session, user_message)
         if rewrite_hint:
-            # 给 LLM 一个显式的"上一次不好"提示
             messages.append(
                 Message(
                     role="system",
@@ -296,9 +491,230 @@ class TurnRunner:
                 buffer += chunk
                 yield ("token", chunk)
         except Exception as exc:
-            # 原文进 server 日志用于排查；只把一个脱敏 code 送到前端，避免把
-            # provider 名 / 原 JSON 糊到用户正在看的对话流里。
             logger.warning("stream_turn backend error: %s", exc)
+            yield ("error", "UPSTREAM_LLM_STREAM_FAILED")
+            return
+
+        parsed = parse_status_sentinel(buffer)
+        yield ("final", "")
+        yield ("status", parsed.status)
+        yield ("visible", parsed.visible_text)
+
+    # ------------------------------------------------------------------
+    # On-demand 模式（v2.6 · 真模型按需）
+    # ------------------------------------------------------------------
+    async def _stream_turn_on_demand(
+        self,
+        session: SessionState,
+        user_message: str,
+        *,
+        rewrite_hint: Optional[str] = None,
+    ) -> AsyncIterator[Tuple[str, object]]:
+        """Pass 1 · 工具规划契约 → read_skill_batch → Pass 2 · 流式正文。
+
+        v2.6 ADR-2/6：
+        - Pass 1 message.content 整段丢弃（已在 backend.call_tools_only 解析时分离）
+        - 6 项校验全程记录但不补全；任何 violation 都进 trace 进 DB
+        - Pass 1 失败（网络 / 4xx）→ 不兜底，直接发 error，让 benchmark 看到真信号
+        """
+        current_round = session.round_count + 1
+        target_rounds = effective_target_rounds(session.user_preferences)
+
+        # ---- Pass 1 · 工具规划契约 ----
+        runtime_block = _runtime_state_block_pass1(
+            session, current_round, target_rounds, bundle=self.bundle
+        )
+        skill_index = self.bundle.build_skill_index_block()
+        pass1_system = self.bundle.compose_pass1_system(
+            runtime_state_block=runtime_block,
+            skill_index_block=skill_index,
+        )
+
+        pass1_msgs: List[Message] = [
+            Message(role="system", content=pass1_system, cache_breakpoint=True),
+        ]
+        # Pass 1 也带 history（便于 LLM 判断"该选哪个 phase / 是否第一次见某话题"）
+        for t in session.live_turns():
+            pass1_msgs.append(Message(role="user", content=t.user_message))
+            if t.oriself_text:
+                pass1_msgs.append(Message(role="assistant", content=t.oriself_text))
+        pass1_msgs.append(Message(role="user", content=user_message))
+        if rewrite_hint:
+            pass1_msgs.append(
+                Message(
+                    role="system",
+                    content=(
+                        "[rewrite-hint] 用户对上一轮回复不满意，请重新规划这一轮要读哪些 skill。"
+                        + (f"用户意见：{rewrite_hint}" if rewrite_hint.strip() else "")
+                    ),
+                )
+            )
+
+        catalogue = self.bundle.list_all_names()
+        tool_schema = read_skill_tool_schema(catalogue)
+
+        logger.info(
+            "[v2.6 pass1] round=%d catalogue=%d system_bytes=%d",
+            current_round,
+            len(catalogue),
+            len(pass1_system.encode("utf-8")),
+        )
+
+        try:
+            pass1_result: Pass1Result = await self.backend.call_tools_only(
+                pass1_msgs, tools=[tool_schema]
+            )
+        except Exception as exc:
+            logger.warning("pass1 call_tools_only error: %s", exc)
+            yield ("error", "UPSTREAM_LLM_PASS1_FAILED")
+            return
+
+        # ---- 解析 tool_calls + 6 项校验（zero_tool_read 在这层判） ----
+        already_loaded = _collect_already_loaded_from_history(session)
+        violations: List[SkillViolation] = []
+        raw_names: List[str] = []
+        for tc in pass1_result.tool_calls:
+            if tc.name != "read_skill":
+                # schema 只声明 read_skill；其他名字按 invalid_skill 记录
+                violations.append(
+                    SkillViolation(
+                        kind="invalid_skill",
+                        detail=f"unexpected tool: {tc.name}",
+                    )
+                )
+                continue
+            if tc.arguments_parse_error:
+                violations.append(
+                    SkillViolation(
+                        kind="invalid_skill",
+                        detail=f"args parse error: {tc.arguments_parse_error}",
+                    )
+                )
+                continue
+            args_names = tc.arguments.get("names")
+            if not isinstance(args_names, list):
+                violations.append(
+                    SkillViolation(
+                        kind="invalid_skill",
+                        detail=f"names not list: {type(args_names).__name__}",
+                    )
+                )
+                continue
+            raw_names.extend([str(n) for n in args_names])
+
+        if not pass1_result.tool_calls:
+            violations.append(
+                SkillViolation(
+                    kind="zero_tool_read",
+                    detail=f"R{current_round}: 0 tool_calls",
+                )
+            )
+
+        read_result = read_skill_batch(
+            self.bundle,
+            raw_names,
+            already_loaded=already_loaded,
+            current_round=current_round,
+        )
+        violations.extend(read_result.violations)
+
+        # codex 第二轮 P2 修复：Pass 2 只装载本轮 LLM 选过的项（含 redundant），
+        # **不**累积历史所有 skill。否则 R7 的 Pass 2 system 会同时塞 R1 的
+        # phase-onboarding + R2 的 phase-warmup + ... 抵消按需加载的上下文缩减。
+        loaded_for_pass2 = read_result.final_names
+        # 本轮**新增**的（去掉 already_loaded）落到 conversations.loaded_skill_names；
+        # 这样下一轮 already_loaded 自然 union 全部历史选择，不会双重计数。
+        newly_loaded = read_result.newly_loaded_names
+
+        # chosen_phase 从 final_names 推（含 redundant，覆盖跨轮 phase 复读）。
+        chosen_phase: Optional[str] = next(
+            (n for n in loaded_for_pass2 if self.bundle.is_phase_name(n)),
+            None,
+        )
+        theoretical = choose_phase_key(session, current_round)
+        phase_match = bool(chosen_phase) and chosen_phase == theoretical
+
+        # 落 Pass 1 trace
+        tool_calls_payload = _serialize_tool_calls(pass1_result.tool_calls)
+        trace = Pass1Trace(
+            tool_calls_json=tool_calls_payload,
+            loaded_skill_names=newly_loaded,
+            violations=violations,
+            chosen_phase_key=chosen_phase,
+            phase_match_rn=phase_match,
+            skill_loader_mode="on-demand",
+            model=str(getattr(self.backend, "model", self.backend.provider_name)),
+            content_dropped=pass1_result.content_dropped or "",
+        )
+        yield ("pass1", trace)
+
+        # 仍然给前端发一条 quill 行（用 chosen_phase 推 needs；缺 phase 时空列表）
+        quill_phase = chosen_phase or theoretical
+        phase_ref = self.bundle.refs.get(quill_phase) if quill_phase else None
+        needs_list: List[str] = []
+        if phase_ref is not None:
+            raw_needs = phase_ref.meta.get("needs") or []
+            if isinstance(raw_needs, list):
+                needs_list = [str(n) for n in raw_needs if n]
+        seen_phases, seen_techniques = _collect_seen_from_history(
+            session, self.bundle
+        )
+        quill_lines, _, _ = _derive_quill_lines(
+            phase_key=quill_phase or "",
+            needs=needs_list,
+            seen_phases=seen_phases,
+            seen_techniques=seen_techniques,
+        )
+        yield ("quill", quill_lines)
+
+        # ---- Pass 2 · 流式正文 ----
+        runtime_block_p2 = _runtime_state_block_pass2(
+            session, current_round, target_rounds, chosen_phase
+        )
+        pass2_system = self.bundle.compose_pass2_system(
+            domain=session.domain,
+            runtime_state_block=runtime_block_p2,
+            loaded_names=loaded_for_pass2,
+        )
+
+        logger.info(
+            "[v2.6 pass2] round=%d phase=%s loaded=%d new=%d system_bytes=%d violations=%s",
+            current_round,
+            chosen_phase or "<none>",
+            len(loaded_for_pass2),
+            len(newly_loaded),
+            len(pass2_system.encode("utf-8")),
+            [v.kind for v in violations],
+        )
+
+        pass2_msgs: List[Message] = [
+            Message(role="system", content=pass2_system, cache_breakpoint=True),
+        ]
+        for t in session.live_turns():
+            pass2_msgs.append(Message(role="user", content=t.user_message))
+            if t.oriself_text:
+                pass2_msgs.append(Message(role="assistant", content=t.oriself_text))
+        pass2_msgs.append(Message(role="user", content=user_message))
+        if rewrite_hint:
+            pass2_msgs.append(
+                Message(
+                    role="system",
+                    content=(
+                        "[rewrite-hint] 用户对上一轮的回复不满意，请换一个说法重新回答。"
+                        + (f"用户的意见：{rewrite_hint}" if rewrite_hint.strip() else "")
+                    ),
+                )
+            )
+
+        buffer = ""
+        try:
+            async for chunk in self.backend.stream_text(pass2_msgs):
+                if not chunk:
+                    continue
+                buffer += chunk
+                yield ("token", chunk)
+        except Exception as exc:
+            logger.warning("pass2 stream error: %s", exc)
             yield ("error", "UPSTREAM_LLM_STREAM_FAILED")
             return
 
@@ -455,8 +871,14 @@ def advance_state(
     user_message: str,
     oriself_visible: str,
     status: str,
+    *,
+    loaded_skills: Optional[List[str]] = None,
 ) -> SessionState:
-    """把完成的一轮追加到 session。返回新的 SessionState（不可变风格）。"""
+    """把完成的一轮追加到 session。返回新的 SessionState（不可变风格）。
+
+    `loaded_skills` 在 on-demand 模式下应传本轮 Pass 1 真正加载的 skill 名字，
+    让下一轮 Pass 1 看到"本会话已读"列表。static 模式传 None / 空列表即可。
+    """
     round_number = session.round_count + 1
     new_turn = Turn(
         round_number=round_number,
@@ -464,6 +886,7 @@ def advance_state(
         oriself_text=oriself_visible,
         status=status,
         discarded=False,
+        loaded_skills=list(loaded_skills or []),
     )
 
     new_prefs = session.user_preferences

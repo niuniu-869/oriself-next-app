@@ -65,10 +65,23 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
 
-    # v2.5.3 · in-place 兼容迁移：为旧库的 conversations 补上 quill_json 列。
-    # create_all 不会为已存在的表新增列，所以这里显式 ALTER。SQLite 走 PRAGMA；
-    # PostgreSQL 走 ADD COLUMN IF NOT EXISTS。失败不阻断启动——列缺失时回落到
-    # `quill_json IS NULL` 的默认路径，仅会让旧 letter 看不到 quill 行。
+    # v2.5.3 / v2.6.0 · in-place 兼容迁移。create_all 不会为已存在的表新增列，
+    # 所以这里显式 ALTER。SQLite 走 PRAGMA；PostgreSQL 走 ADD COLUMN IF NOT EXISTS。
+    # 失败不阻断启动——列缺失时回落到 `xxx IS NULL` 的默认路径。
+    #
+    # v2.5.3 加了 quill_json；v2.6.0 加 7 列（tool_calls_json / loaded_skill_names /
+    # pass1_violations_json / chosen_phase_key / phase_match_rn / skill_loader_mode /
+    # model），分别承载 Pass 1 trace。
+    _v26_columns = [
+        ("quill_json", "TEXT"),
+        ("tool_calls_json", "TEXT"),
+        ("loaded_skill_names", "TEXT"),
+        ("pass1_violations_json", "TEXT"),
+        ("chosen_phase_key", "VARCHAR(32)"),
+        ("phase_match_rn", "BOOLEAN"),
+        ("skill_loader_mode", "VARCHAR(16)"),
+        ("model", "VARCHAR(64)"),
+    ]
     try:
         url = str(engine.url)
         with engine.begin() as conn:
@@ -77,14 +90,17 @@ def init_db() -> None:
                     "PRAGMA table_info(conversations)"
                 ).fetchall()
                 existing = {row[1] for row in cols}  # row[1] = column name
-                if "quill_json" not in existing:
-                    conn.exec_driver_sql(
-                        "ALTER TABLE conversations ADD COLUMN quill_json TEXT"
-                    )
+                for col_name, col_type in _v26_columns:
+                    if col_name not in existing:
+                        conn.exec_driver_sql(
+                            f"ALTER TABLE conversations ADD COLUMN {col_name} {col_type}"
+                        )
             else:
-                conn.exec_driver_sql(
-                    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS quill_json TEXT"
-                )
+                for col_name, col_type in _v26_columns:
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE conversations "
+                        f"ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
+                    )
     except Exception:
         pass
 
