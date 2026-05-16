@@ -27,6 +27,22 @@ APPS=("oriself-server" "oriself-web")
 
 mkdir -p "$ROOT/logs"
 
+# ─────────── 非交互式 SSH 下补 nvm 的 PATH ───────────
+# `ssh host './ops/oriself.sh ...'` 不加载 ~/.bashrc，nvm 装的 pm2 / pnpm
+# 不在 PATH 里，need_pm2 会直接 abort。这里探测一次：若 pm2 不可见，就把
+# 最新一个 node 版本的 bin 目录补进 PATH。
+ensure_node_on_path() {
+  if command -v pm2 >/dev/null 2>&1; then
+    return 0
+  fi
+  local nvm_bin
+  nvm_bin="$(ls -d "${NVM_DIR:-$HOME/.nvm}"/versions/node/*/bin 2>/dev/null | sort -V | tail -1)"
+  if [ -n "$nvm_bin" ] && [ -d "$nvm_bin" ]; then
+    export PATH="$nvm_bin:$PATH"
+  fi
+}
+ensure_node_on_path
+
 # ─────────────────────── 前置检查 ────────────────────────
 
 need_pm2() {

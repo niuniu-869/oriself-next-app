@@ -55,7 +55,7 @@ pnpm build && pnpm start    # 本地 prod；Docker 下 BUILD_STANDALONE=1
 | `rewriteLastTurn(id, {hint?})` | `POST /letters/:id/turn/rewrite` (SSE) | 标 discarded 后重新流 |
 | `composeResult(id)` / `getResult` | `POST /letters/:id/result` | 触发 / 读取报告生成 |
 | `getIssue(slug)` | `GET /issues/:slug` | 元数据 |
-| `publishIssue(slug, isPublic)` | `PATCH /issues/:slug/publish` | 公开 / 私有切换 |
+| `publishIssue(slug, isPublic)` | `PATCH /issues/:slug/publish` | 公开展示墙收录开关（前端暂未接入；不影响 issue 访问） |
 | `submitFeedback(payload)` | `POST /feedback` | 匿名反馈 |
 
 SSE 解析见 `streamToDone`：按 `\n\n` 切 frame，识别 `event:` / `data:`，`done` 事件填充 `TurnDonePayload`（类型见 `lib/types.ts`）。

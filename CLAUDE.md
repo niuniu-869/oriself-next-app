@@ -165,5 +165,6 @@ python -m oriself_server.cli --provider mock   # 终端里直接跑一封信
 |---|---|---|
 | 2026-04-18 22:30:17 | 初始化根级 CLAUDE.md；创建 `web/CLAUDE.md`、`server/CLAUDE.md`；写入 `.claude/index.json` | `/zcf:init-project` 自适应扫描 |
 | *(保留给手写记录；本行以下内容在重新运行时不会被覆盖)* | | |
+| 2026-05-17 | issue 访问模型改为 capability-URL（slug 即凭证）：删除 `is_public`→403 访问门，slug 增熵至 64bit，移除前端「公开/私有」toggle，issue 页加 `robots noindex`。`issue_is_public` 保留作未来公开展示墙的收录标记 | 手动 · 修私有报告本人打不开的 bug |
 
 <!-- END ZCF:AUTO-GENERATED (root) -->

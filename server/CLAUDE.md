@@ -76,9 +76,9 @@ data: {"message": "..."}
 
 | Method | Path | 返回 | 说明 |
 |---|---|---|---|
-| GET | `/issues/{slug}` | `IssueResponse` | 元数据；`is_public=False` 时 403 |
-| GET | `/issues/{slug}/render` | HTML | 给前端 iframe 用；强制 `Content-Security-Policy: sandbox allow-scripts allow-same-origin; default-src 'self' 'unsafe-inline' https://fonts.*; ...` |
-| PATCH | `/issues/{slug}/publish` | `IssueResponse` | 切换 `is_public`；**MVP 不鉴权**，生产需换 owner token |
+| GET | `/issues/{slug}` | `IssueResponse` | 元数据；凭 slug 即可访问（capability-URL，无访问门） |
+| GET | `/issues/{slug}/render` | HTML | 给前端 iframe 用；凭 slug 即可访问；强制 `Content-Security-Policy: sandbox allow-scripts allow-same-origin; default-src 'self' 'unsafe-inline' https://fonts.*; ...` |
+| PATCH | `/issues/{slug}/publish` | `IssueResponse` | 切换 `issue_is_public`（未来公开展示墙的收录标记，**不影响访问**）；MVP 不鉴权 |
 
 ### 3.3 `/feedback`（`routes/feedback.py`）
 
@@ -248,5 +248,6 @@ sanitize_report_html + escape pull_quotes
 |---|---|
 | 2026-04-18 22:30:17 | 初始化 `server/CLAUDE.md` |
 | *(保留给手写记录)* | |
+| 2026-05-17 | issue 访问改为 capability-URL：`get_issue`/`render_issue` 删除 `is_public`→403 访问门，slug 熵 `token_hex(3→8)`（24→64 bit） |
 
 <!-- END ZCF:AUTO-GENERATED (server) -->
