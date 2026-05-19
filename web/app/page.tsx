@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { RecentLetters } from "@/components/home/recent-letters";
-import { APP_VERSION } from "@/lib/version";
+import { APP_VERSION, getServerVersion } from "@/lib/version";
 
 /**
  * Landing · 作品集风格。
@@ -8,7 +8,8 @@ import { APP_VERSION } from "@/lib/version";
  * 不卖。当成一个作品。一个名字、一行版权页式注释、一个入口。
  * 没有 hero 广告语、没有"发生什么"分段、没有 CTA 文案动员。
  */
-export default function LandingPage() {
+export default async function LandingPage() {
+  const serverVersion = await getServerVersion();
   return (
     <main className="relative z-10 min-h-screen flex flex-col">
       {/* Hero — single word, monumental */}
@@ -49,7 +50,11 @@ export default function LandingPage() {
       {/* Colophon — barely visible, edge of the page */}
       <footer className="px-6 sm:px-8 pb-16 sm:pb-8 pt-16">
         <div className="max-w-[1200px] mx-auto flex flex-wrap justify-between items-baseline gap-y-3 gap-x-6 font-mono text-[10px] tracking-widest uppercase text-ink-muted">
-          <span>OriSelf · Issue 04 · v{APP_VERSION}</span>
+          <span>
+            {`OriSelf · Issue 04 · web v${APP_VERSION}${
+              serverVersion ? ` · server v${serverVersion}` : ""
+            }`}
+          </span>
           <div className="flex items-baseline gap-[14px]">
             <a
               href="https://github.com/Deep-Thinks/oriself-next"

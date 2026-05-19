@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oriself-server"
-version = "0.1.0"
+version = "2.6.0"
 description = "OriSelf Next · FastAPI 后端。对话循环、guardrails、多 provider LLM。"
 readme = "README.md"
 requires-python = ">=3.10"
