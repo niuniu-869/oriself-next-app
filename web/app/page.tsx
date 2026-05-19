@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { RecentLetters } from "@/components/home/recent-letters";
+import { APP_VERSION } from "@/lib/version";
 
 /**
  * Landing · 作品集风格。
@@ -48,7 +49,7 @@ export default function LandingPage() {
       {/* Colophon — barely visible, edge of the page */}
       <footer className="px-6 sm:px-8 pb-16 sm:pb-8 pt-16">
         <div className="max-w-[1200px] mx-auto flex flex-wrap justify-between items-baseline gap-y-3 gap-x-6 font-mono text-[10px] tracking-widest uppercase text-ink-muted">
-          <span>OriSelf · Issue 04 · v2.5.4</span>
+          <span>OriSelf · Issue 04 · v{APP_VERSION}</span>
           <div className="flex items-baseline gap-[14px]">
             <a
               href="https://github.com/Deep-Thinks/oriself-next"
